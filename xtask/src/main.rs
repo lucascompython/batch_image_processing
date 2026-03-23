@@ -58,10 +58,15 @@ enum SubCommands {
     MinSize(MinSizeArgs),
     /// Build release version optimized for execution speed
     Speed(SpeedArgs),
+    /// Run clippy with fast-dev flags
+    Clippy(ClippyArgs),
 }
 
 #[derive(Args, Debug)]
 struct FastDevArgs {}
+
+#[derive(Args, Debug)]
+struct ClippyArgs {}
 
 #[derive(Args, Debug)]
 struct MinSizeArgs {
@@ -92,14 +97,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         SubCommands::FastDev(args) => build_fast_dev(args)?,
         SubCommands::MinSize(args) => build_min_size(args)?,
         SubCommands::Speed(args) => build_speed(args)?,
+        SubCommands::Clippy(args) => run_clippy(args)?,
     }
 
     Ok(())
 }
 
-fn build_fast_dev(_args: FastDevArgs) -> Result<(), Box<dyn Error>> {
-    let project_root = env::current_dir()?;
-
+fn get_fast_dev_rustflags() -> String {
     let linker_arg = if cfg!(target_os = "windows") {
         "-Clinker=rust-lld.exe"
     } else if cfg!(target_os = "linux") {
@@ -112,10 +116,16 @@ fn build_fast_dev(_args: FastDevArgs) -> Result<(), Box<dyn Error>> {
         .map(|n| n.get())
         .unwrap_or(4);
 
-    let dev_rustflags = format!(
+    format!(
         "{} -Zthreads={} -Zcodegen-backend=cranelift -Zshare-generics=y",
         linker_arg, num_threads
-    );
+    )
+}
+
+fn build_fast_dev(_args: FastDevArgs) -> Result<(), Box<dyn Error>> {
+    let project_root = env::current_dir()?;
+
+    let dev_rustflags = get_fast_dev_rustflags();
 
     println!("Building in dev mode (fast build)...");
 
@@ -126,6 +136,22 @@ fn build_fast_dev(_args: FastDevArgs) -> Result<(), Box<dyn Error>> {
     run_command(cmd, &args, &[("RUSTFLAGS", &dev_rustflags)], &project_root)?;
 
     println!("Fast-dev build finished successfully.");
+    Ok(())
+}
+
+fn run_clippy(_args: ClippyArgs) -> Result<(), Box<dyn Error>> {
+    let project_root = env::current_dir()?;
+
+    let dev_rustflags = get_fast_dev_rustflags();
+
+    println!("Running clippy with fast-dev flags...");
+
+    let cmd = "cargo";
+    let args = vec!["+nightly", "clippy"];
+
+    run_command(cmd, &args, &[("RUSTFLAGS", &dev_rustflags)], &project_root)?;
+
+    println!("Clippy finished successfully.");
     Ok(())
 }
 
