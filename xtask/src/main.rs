@@ -23,7 +23,7 @@ const RUN_CMD: &[&str] = &["cargo", "run"];
 const BUILD_CMD: &[&str] = &["cargo", "build", "--release"];
 
 /// Update this with your actual binary name to locate the executable correctly for things like UPX and size reporting.
-const BINARY_NAME: &str = "xtask-template";
+const BINARY_NAME: &str = "batch_image_processing";
 
 #[derive(Debug)]
 struct CommandError {
