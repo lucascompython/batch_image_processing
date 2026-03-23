@@ -13,6 +13,11 @@ rfd = "0.17"
 pdf-writer = "0.14"
 tokio = { version = "1", features = ["fs", "sync"] }
 iced_aw = { git = "https://github.com/iced-rs/iced_aw", version = "0.13", default-features = false, features = ["color_picker"] }
+zune-jpeg = "0.5"
+zune-imageprocs = "0.5"
+memmap2 = "0.9"
+zune-core = "0.5"
+zune-image = { version = "0.5", default-features = false, features = ["simd", "threads", "jpeg"] }
 
 
 [profile.dev]

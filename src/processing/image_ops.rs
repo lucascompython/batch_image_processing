@@ -2,6 +2,7 @@ use ab_glyph::{FontRef, PxScale};
 use image::codecs::jpeg::JpegEncoder;
 use image::{DynamicImage, ImageReader, RgbaImage};
 use imageproc::drawing::{draw_text_mut, text_size};
+use memmap2::Mmap;
 use pdf_writer::{Content, Finish, Name, Pdf, Rect, Ref};
 use std::io::BufWriter;
 use std::path::Path;
@@ -75,6 +76,28 @@ const EMBEDDED_FONT: &[u8] = include_bytes!("../assets/Inter-Regular.ttf");
 /// # Errors
 /// Returns an error if the file cannot be read or decoded.
 pub fn load_image(path: &Path) -> Result<DynamicImage, String> {
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("Failed to open {}: {e}", path.display()))?;
+
+    // Try blazing-fast zune-jpeg with memory mapping first
+    if let Ok(mmap) = unsafe { Mmap::map(&file) } {
+        let options = zune_core::options::DecoderOptions::default()
+            .jpeg_set_out_colorspace(zune_core::colorspace::ColorSpace::RGBA);
+
+        let cursor = zune_core::bytestream::ZCursor::new(&mmap[..]);
+        let mut decoder = zune_jpeg::JpegDecoder::new_with_options(cursor, options);
+        if decoder.decode_headers().is_ok()
+            && let Some((w, h)) = decoder.dimensions()
+            && let Ok(pixels) = decoder.decode()
+            && let Some(rgba) = RgbaImage::from_raw(w as u32, h as u32, pixels)
+        {
+            return Ok(DynamicImage::ImageRgba8(rgba));
+        }
+    }
+
+    println!("Failed to decode {}", path.display());
+
+    // Fallback to generic `image` crate decoder if it's a PNG or fails
     ImageReader::open(path)
         .map_err(|e| format!("Failed to open {}: {e}", path.display()))?
         .decode()
@@ -86,8 +109,8 @@ pub fn load_image(path: &Path) -> Result<DynamicImage, String> {
 /// # Errors
 /// Returns an error if the file cannot be created or encoded.
 pub fn save_jpeg(img: &DynamicImage, path: &Path, quality: u8) -> Result<(), String> {
-    let file =
-        std::fs::File::create(path).map_err(|e| format!("Failed to create {}: {e}", path.display()))?;
+    let file = std::fs::File::create(path)
+        .map_err(|e| format!("Failed to create {}: {e}", path.display()))?;
     let writer = BufWriter::new(file);
     let encoder = JpegEncoder::new_with_quality(writer, quality);
     img.write_with_encoder(encoder)
@@ -104,51 +127,87 @@ pub fn rotate_image(img: &DynamicImage, rotation: Rotation) -> DynamicImage {
     }
 }
 
+/// Pre-render text to a transparent RGBA stamp buffer.
+///
+/// This avoids re-rasterizing vector glyphs for every image in a batch.
+/// Returns the stamp image along with its dimensions.
+pub fn render_text_stamp(config: &TextOverlayConfig, filename: &str) -> RgbaImage {
+    let text = config.text_template.replace("{filename}", filename);
+    let font = FontRef::try_from_slice(EMBEDDED_FONT).expect("embedded font is valid");
+    let scale = PxScale::from(config.font_size);
+    let (tw, th) = text_size(scale, &font, &text);
+
+    // Create a transparent buffer big enough for text + shadow offset
+    let buf_w = tw + 2;
+    let buf_h = th + 2;
+    let mut stamp = RgbaImage::from_pixel(buf_w, buf_h, image::Rgba([0, 0, 0, 0]));
+
+    // Shadow
+    let shadow = image::Rgba([0u8, 0, 0, 180]);
+    draw_text_mut(&mut stamp, shadow, 1, 1, scale, &font, &text);
+    // Foreground
+    let color = image::Rgba([
+        config.color.r,
+        config.color.g,
+        config.color.b,
+        config.color.a,
+    ]);
+    draw_text_mut(&mut stamp, color, 0, 0, scale, &font, &text);
+
+    stamp
+}
+
+/// Overlay a pre-rendered text stamp onto an image.
+///
+/// This is the fast path for batch processing: render the stamp once,
+/// then call this for every image.
+pub fn overlay_text_with_stamp(
+    img: &DynamicImage,
+    config: &TextOverlayConfig,
+    stamp: &RgbaImage,
+) -> DynamicImage {
+    let mut rgba = img.to_rgba8();
+    let (img_w, img_h) = (rgba.width(), rgba.height());
+    let margin = config.margin;
+    let stamp_w = stamp.width();
+    let stamp_h = stamp.height();
+
+    let (x, y) = match config.position {
+        TextPosition::TopLeft => (margin as i64, margin as i64),
+        TextPosition::TopRight => (
+            (img_w.saturating_sub(stamp_w + margin)) as i64,
+            margin as i64,
+        ),
+        TextPosition::BottomLeft => (
+            margin as i64,
+            (img_h.saturating_sub(stamp_h + margin)) as i64,
+        ),
+        TextPosition::BottomRight => (
+            (img_w.saturating_sub(stamp_w + margin)) as i64,
+            (img_h.saturating_sub(stamp_h + margin)) as i64,
+        ),
+        TextPosition::Center => (
+            ((img_w.saturating_sub(stamp_w)) / 2) as i64,
+            ((img_h.saturating_sub(stamp_h)) / 2) as i64,
+        ),
+    };
+
+    image::imageops::overlay(&mut rgba, stamp, x, y);
+    DynamicImage::ImageRgba8(rgba)
+}
+
 /// Overlay text onto the image, returning a new `DynamicImage`.
 ///
 /// `filename` is used to expand the `{filename}` template variable.
+/// For single-image use (preview). For batch, prefer `render_text_stamp`
+/// + `overlay_text_with_stamp`.
 pub fn overlay_text(
     img: &DynamicImage,
     config: &TextOverlayConfig,
     filename: &str,
 ) -> DynamicImage {
-    let mut rgba = img.to_rgba8();
-    let text = config.text_template.replace("{filename}", filename);
-
-    let font = FontRef::try_from_slice(EMBEDDED_FONT).expect("embedded font is valid");
-    let scale = PxScale::from(config.font_size);
-
-    let (text_width, text_height) = text_size(scale, &font, &text);
-
-    let (img_w, img_h) = (rgba.width(), rgba.height());
-    let margin = config.margin;
-
-    let (x, y) = match config.position {
-        TextPosition::TopLeft => (margin as i32, margin as i32),
-        TextPosition::TopRight => {
-            ((img_w.saturating_sub(text_width + margin)) as i32, margin as i32)
-        }
-        TextPosition::BottomLeft => {
-            (margin as i32, (img_h.saturating_sub(text_height + margin)) as i32)
-        }
-        TextPosition::BottomRight => (
-            (img_w.saturating_sub(text_width + margin)) as i32,
-            (img_h.saturating_sub(text_height + margin)) as i32,
-        ),
-        TextPosition::Center => (
-            ((img_w.saturating_sub(text_width)) / 2) as i32,
-            ((img_h.saturating_sub(text_height)) / 2) as i32,
-        ),
-    };
-
-    let color = image::Rgba([config.color.r, config.color.g, config.color.b, config.color.a]);
-
-    // Draw a shadow first for readability against any background.
-    let shadow = image::Rgba([0u8, 0, 0, 180]);
-    draw_text_mut(&mut rgba, shadow, x + 1, y + 1, scale, &font, &text);
-    draw_text_mut(&mut rgba, color, x, y, scale, &font, &text);
-
-    DynamicImage::ImageRgba8(rgba)
+    let stamp = render_text_stamp(config, filename);
+    overlay_text_with_stamp(img, config, &stamp)
 }
 
 /// Generate a thumbnail that fits within `max_size` pixels on the longest side.

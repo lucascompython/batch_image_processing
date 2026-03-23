@@ -55,12 +55,21 @@ pub fn process_batch(
     let total = paths.len();
     let completed = Arc::new(AtomicUsize::new(0));
 
+    // Pre-render a shared text stamp if the template doesn't contain {filename}
+    let shared_stamp = config.text_overlay.as_ref().and_then(|tc| {
+        if !tc.text_template.contains("{filename}") {
+            Some(image_ops::render_text_stamp(tc, ""))
+        } else {
+            None
+        }
+    });
+
     // Process all images in parallel natively without pre-loading into a massive memory vector.
     paths
         .par_iter()
         .map(|source| {
             let load_result = image_ops::load_image(source);
-            let result = process_single(source, load_result, config);
+            let result = process_single(source, load_result, config, shared_stamp.as_ref());
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
             progress_callback(done, total);
             result
@@ -72,6 +81,7 @@ fn process_single(
     source: &Path,
     load_result: Result<image::DynamicImage, String>,
     config: &BatchConfig,
+    shared_stamp: Option<&image::RgbaImage>,
 ) -> ProcessResult {
     let stem = source
         .file_stem()
@@ -94,9 +104,16 @@ fn process_single(
         img = image_ops::rotate_image(&img, config.rotation);
     }
 
-    // Apply text overlay
+    // Apply text overlay using cached stamp when possible
     if let Some(ref text_config) = config.text_overlay {
-        img = image_ops::overlay_text(&img, text_config, stem);
+        if let Some(stamp) = shared_stamp {
+            // Static text: reuse the shared pre-rendered stamp
+            img = image_ops::overlay_text_with_stamp(&img, text_config, stamp);
+        } else {
+            // Per-file text: render a stamp for this filename
+            let stamp = image_ops::render_text_stamp(text_config, stem);
+            img = image_ops::overlay_text_with_stamp(&img, text_config, &stamp);
+        }
     }
 
     // Export
