@@ -1,10 +1,7 @@
 use ab_glyph::{FontRef, PxScale};
-use image::codecs::jpeg::JpegEncoder;
 use image::{DynamicImage, ImageReader, RgbaImage};
 use imageproc::drawing::{draw_text_mut, text_size};
-use memmap2::Mmap;
 use pdf_writer::{Content, Finish, Name, Pdf, Rect, Ref};
-use std::io::BufWriter;
 use std::path::Path;
 
 /// Rotation direction (clockwise).
@@ -76,21 +73,11 @@ const EMBEDDED_FONT: &[u8] = include_bytes!("../assets/Inter-Regular.ttf");
 /// # Errors
 /// Returns an error if the file cannot be read or decoded.
 pub fn load_image(path: &Path) -> Result<DynamicImage, String> {
-    let file =
-        std::fs::File::open(path).map_err(|e| format!("Failed to open {}: {e}", path.display()))?;
+    let raw = std::fs::read(path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
 
-    // Try blazing-fast zune-jpeg with memory mapping first
-    if let Ok(mmap) = unsafe { Mmap::map(&file) } {
-        let options = zune_core::options::DecoderOptions::default()
-            .jpeg_set_out_colorspace(zune_core::colorspace::ColorSpace::RGBA);
-
-        let cursor = zune_core::bytestream::ZCursor::new(&mmap[..]);
-        let mut decoder = zune_jpeg::JpegDecoder::new_with_options(cursor, options);
-        if decoder.decode_headers().is_ok()
-            && let Some((w, h)) = decoder.dimensions()
-            && let Ok(pixels) = decoder.decode()
-            && let Some(rgba) = RgbaImage::from_raw(w as u32, h as u32, pixels)
-        {
+    // Try turbojpeg (libjpeg-turbo) first — blazing fast SIMD decode
+    if let Ok(img) = turbojpeg::decompress(&raw, turbojpeg::PixelFormat::RGBA) {
+        if let Some(rgba) = RgbaImage::from_raw(img.width as u32, img.height as u32, img.pixels) {
             return Ok(DynamicImage::ImageRgba8(rgba));
         }
     }
@@ -109,12 +96,19 @@ pub fn load_image(path: &Path) -> Result<DynamicImage, String> {
 /// # Errors
 /// Returns an error if the file cannot be created or encoded.
 pub fn save_jpeg(img: &DynamicImage, path: &Path, quality: u8) -> Result<(), String> {
-    let file = std::fs::File::create(path)
-        .map_err(|e| format!("Failed to create {}: {e}", path.display()))?;
-    let writer = BufWriter::new(file);
-    let encoder = JpegEncoder::new_with_quality(writer, quality);
-    img.write_with_encoder(encoder)
-        .map_err(|e| format!("Failed to encode JPEG {}: {e}", path.display()))
+    let rgb = img.to_rgb8();
+    let (w, h) = (rgb.width(), rgb.height());
+    let turbo_img = turbojpeg::Image {
+        pixels: rgb.as_raw().as_slice(),
+        width: w as usize,
+        pitch: w as usize * 3,
+        height: h as usize,
+        format: turbojpeg::PixelFormat::RGB,
+    };
+    let jpeg_data = turbojpeg::compress(turbo_img, quality as i32, turbojpeg::Subsamp::Sub2x2)
+        .map_err(|e| format!("Failed to encode JPEG {}: {e}", path.display()))?;
+    std::fs::write(path, &*jpeg_data)
+        .map_err(|e| format!("Failed to write JPEG {}: {e}", path.display()))
 }
 
 /// Rotate the image clockwise.
@@ -162,11 +156,15 @@ pub fn render_text_stamp(config: &TextOverlayConfig, filename: &str) -> RgbaImag
 /// This is the fast path for batch processing: render the stamp once,
 /// then call this for every image.
 pub fn overlay_text_with_stamp(
-    img: &DynamicImage,
+    img: DynamicImage,
     config: &TextOverlayConfig,
     stamp: &RgbaImage,
 ) -> DynamicImage {
-    let mut rgba = img.to_rgba8();
+    // Avoid a full pixel-by-pixel clone if the image is already RGBA
+    let mut rgba = match img {
+        DynamicImage::ImageRgba8(existing) => existing,
+        other => other.to_rgba8(),
+    };
     let (img_w, img_h) = (rgba.width(), rgba.height());
     let margin = config.margin;
     let stamp_w = stamp.width();
@@ -201,18 +199,17 @@ pub fn overlay_text_with_stamp(
 /// `filename` is used to expand the `{filename}` template variable.
 /// For single-image use (preview). For batch, prefer `render_text_stamp`
 /// + `overlay_text_with_stamp`.
-pub fn overlay_text(
-    img: &DynamicImage,
-    config: &TextOverlayConfig,
-    filename: &str,
-) -> DynamicImage {
+pub fn overlay_text(img: DynamicImage, config: &TextOverlayConfig, filename: &str) -> DynamicImage {
     let stamp = render_text_stamp(config, filename);
     overlay_text_with_stamp(img, config, &stamp)
 }
 
 /// Generate a thumbnail that fits within `max_size` pixels on the longest side.
+/// Uses Triangle (bilinear) filter — ~3x faster than the default Lanczos3,
+/// visually identical at preview sizes.
 pub fn generate_thumbnail(img: &DynamicImage, max_size: u32) -> RgbaImage {
-    img.thumbnail(max_size, max_size).to_rgba8()
+    img.resize(max_size, max_size, image::imageops::FilterType::Triangle)
+        .to_rgba8()
 }
 
 /// Export a single image to a PDF file.
@@ -270,13 +267,16 @@ pub fn export_images_to_pdf(images: &[&DynamicImage], output_path: &Path) -> Res
         let w_pt = w as f32;
         let h_pt = h as f32;
 
-        // Encode as JPEG for the PDF
-        let mut jpeg_buf = Vec::new();
-        {
-            let encoder = JpegEncoder::new_with_quality(&mut jpeg_buf, 90);
-            rgb.write_with_encoder(encoder)
-                .map_err(|e| format!("Failed to encode image for PDF: {e}"))?;
-        }
+        // Encode as JPEG for the PDF using turbojpeg
+        let turbo_img = turbojpeg::Image {
+            pixels: rgb.as_raw().as_slice(),
+            width: w as usize,
+            pitch: w as usize * 3,
+            height: h as usize,
+            format: turbojpeg::PixelFormat::RGB,
+        };
+        let jpeg_buf = turbojpeg::compress(turbo_img, 90, turbojpeg::Subsamp::Sub2x2)
+            .map_err(|e| format!("Failed to encode image for PDF: {e}"))?;
 
         // Image XObject
         let image_name = format!("Im{i}");

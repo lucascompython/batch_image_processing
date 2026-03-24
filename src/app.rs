@@ -755,7 +755,7 @@ impl App {
                         tc.margin = (tc.margin as f32 * scale) as u32;
 
                         let filename = path.file_stem().and_then(|n| n.to_str()).unwrap_or("image");
-                        final_thumb = image_ops::overlay_text(&final_thumb, &tc, filename);
+                        final_thumb = image_ops::overlay_text(final_thumb, &tc, filename);
                     }
 
                     let rgba = final_thumb.into_rgba8();

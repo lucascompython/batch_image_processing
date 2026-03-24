@@ -108,11 +108,11 @@ fn process_single(
     if let Some(ref text_config) = config.text_overlay {
         if let Some(stamp) = shared_stamp {
             // Static text: reuse the shared pre-rendered stamp
-            img = image_ops::overlay_text_with_stamp(&img, text_config, stamp);
+            img = image_ops::overlay_text_with_stamp(img, text_config, stamp);
         } else {
             // Per-file text: render a stamp for this filename
             let stamp = image_ops::render_text_stamp(text_config, stem);
-            img = image_ops::overlay_text_with_stamp(&img, text_config, &stamp);
+            img = image_ops::overlay_text_with_stamp(img, text_config, &stamp);
         }
     }
 
