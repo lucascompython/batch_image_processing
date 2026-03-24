@@ -218,8 +218,12 @@ pub fn generate_thumbnail(img: &DynamicImage, max_size: u32) -> RgbaImage {
 ///
 /// # Errors
 /// Returns an error if encoding or writing fails.
-pub fn export_single_image_to_pdf(img: &DynamicImage, output_path: &Path) -> Result<(), String> {
-    export_images_to_pdf(&[img], output_path)
+pub fn export_single_image_to_pdf(
+    img: &DynamicImage,
+    output_path: &Path,
+    quality: u8,
+) -> Result<(), String> {
+    export_images_to_pdf(&[img], output_path, quality)
 }
 
 /// Export multiple images to a multi-page PDF.
@@ -228,7 +232,11 @@ pub fn export_single_image_to_pdf(img: &DynamicImage, output_path: &Path) -> Res
 ///
 /// # Errors
 /// Returns an error if encoding or writing fails.
-pub fn export_images_to_pdf(images: &[&DynamicImage], output_path: &Path) -> Result<(), String> {
+pub fn export_images_to_pdf(
+    images: &[&DynamicImage],
+    output_path: &Path,
+    quality: u8,
+) -> Result<(), String> {
     let mut pdf = Pdf::new();
 
     // We need to assign Ref IDs. Start from 1.
@@ -275,7 +283,7 @@ pub fn export_images_to_pdf(images: &[&DynamicImage], output_path: &Path) -> Res
             height: h as usize,
             format: turbojpeg::PixelFormat::RGB,
         };
-        let jpeg_buf = turbojpeg::compress(turbo_img, 90, turbojpeg::Subsamp::Sub2x2)
+        let jpeg_buf = turbojpeg::compress(turbo_img, quality as i32, turbojpeg::Subsamp::Sub2x2)
             .map_err(|e| format!("Failed to encode image for PDF: {e}"))?;
 
         // Image XObject

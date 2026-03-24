@@ -124,7 +124,9 @@ fn process_single(
 
     let result = match config.output_format {
         OutputFormat::Jpeg => image_ops::save_jpeg(&img, &output_path, config.quality),
-        OutputFormat::Pdf => image_ops::export_single_image_to_pdf(&img, &output_path),
+        OutputFormat::Pdf => {
+            image_ops::export_single_image_to_pdf(&img, &output_path, config.quality)
+        }
     };
 
     match result {
