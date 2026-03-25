@@ -3,6 +3,7 @@ use iced::widget::{
     progress_bar, row, rule, scrollable, slider, text, text_input,
 };
 use iced::{Alignment, Color, Element, Font, Length, Task, Theme};
+use std::borrow::{Borrow, Cow};
 use std::path::PathBuf;
 
 use crate::processing::batch::{BatchConfig, OutputFormat, ProcessResult};
@@ -18,21 +19,16 @@ pub struct PreviewCache {
     rotated_height: u32,
 }
 
-// ── App State ────────────────────────────────────────────────────────────────
-
-pub struct App {
-    // Image list
+pub struct App<'a> {
     image_paths: Vec<PathBuf>,
     selected_index: Option<usize>,
     preview_handle: Option<iced_image::Handle>,
 
-    // Processing settings
     quality: u8,
     rotation: Rotation,
     output_format: OutputFormat,
     output_dir: Option<PathBuf>,
 
-    // Text overlay
     text_enabled: bool,
     text_template: String,
     text_position: TextPosition,
@@ -41,10 +37,9 @@ pub struct App {
     text_color_g: u8,
     text_color_b: u8,
 
-    // Batch processing state
     is_processing: bool,
     progress: f32,
-    status_message: String,
+    status_message: Cow<'a, str>,
     batch_results: Vec<ProcessResult>,
     show_color_picker: bool,
     saved_text_color: Option<(u8, u8, u8)>,
@@ -52,24 +47,19 @@ pub struct App {
     preview_cache: Option<PreviewCache>,
 }
 
-// ── Messages ─────────────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone)]
 pub enum Message {
-    // File operations
     OpenFolder,
     FolderOpened(Option<Vec<PathBuf>>),
     SelectImage(usize),
     ImagePreviewLoaded(usize, Option<(PreviewCache, Vec<u8>, u32, u32)>),
 
-    // Settings
     SetQuality(u8),
     SetRotation(Rotation),
     SetOutputFormat(OutputFormat),
     ChooseOutputDir,
     OutputDirChosen(Option<PathBuf>),
 
-    // Text overlay
     ToggleText(bool),
     SetTextTemplate(String),
     SetTextPosition(TextPosition),
@@ -79,13 +69,10 @@ pub enum Message {
     SubmitColorPicker(Color),
     ColorChanged(Color),
 
-    // Batch processing
     StartBatch,
     BatchComplete(Vec<ProcessResult>),
     BatchProgress(f32),
 }
-
-// ── Rotation / Position display helpers ──────────────────────────────────────
 
 const ROTATION_OPTIONS: &[Rotation] = &[
     Rotation::None,
@@ -136,9 +123,7 @@ impl std::fmt::Display for OutputFormat {
     }
 }
 
-// ── App implementation ───────────────────────────────────────────────────────
-
-impl App {
+impl<'a> App<'a> {
     pub fn new() -> (Self, Task<Message>) {
         (
             Self {
@@ -158,7 +143,7 @@ impl App {
                 text_color_b: 255,
                 is_processing: false,
                 progress: 0.0,
-                status_message: "Ready — Open a folder to begin".to_string(),
+                status_message: Cow::Borrowed("Ready — Open a folder to begin"),
                 batch_results: Vec::new(),
                 show_color_picker: false,
                 saved_text_color: None,
@@ -209,7 +194,7 @@ impl App {
             }
 
             Message::FolderOpened(Some(paths)) => {
-                self.status_message = format!("Loaded {} images", paths.len());
+                self.status_message = Cow::Owned(format!("Loaded {} images", paths.len()));
                 self.image_paths = paths;
                 self.selected_index = None;
                 self.preview_handle = None;
@@ -260,12 +245,11 @@ impl App {
             }
             Message::OutputDirChosen(dir) => {
                 if let Some(ref d) = dir {
-                    self.status_message = format!("Output: {}", d.display());
+                    self.status_message = Cow::Owned(format!("Output: {}", d.display()));
                 }
                 self.output_dir = dir;
             }
 
-            // Text overlay
             Message::ToggleText(on) => {
                 self.text_enabled = on;
                 return self.queue_preview_update();
@@ -312,21 +296,20 @@ impl App {
                 return self.queue_preview_update();
             }
 
-            // Batch processing
             Message::StartBatch => {
                 if self.image_paths.is_empty() {
-                    self.status_message = "No images loaded".to_string();
+                    self.status_message = Cow::Borrowed("No images loaded");
                     return Task::none();
                 }
                 let Some(ref output_dir) = self.output_dir else {
-                    self.status_message = "Select an output folder first".to_string();
+                    self.status_message = Cow::Borrowed("Select an output folder first");
                     return Task::none();
                 };
 
                 self.is_processing = true;
                 self.progress = 0.0;
                 self.batch_results.clear();
-                self.status_message = "Processing...".to_string();
+                self.status_message = Cow::Borrowed("Processing...");
 
                 let paths = self.image_paths.clone();
                 let config = BatchConfig {
@@ -343,8 +326,6 @@ impl App {
 
                 return Task::perform(
                     async move {
-                        // Run the CPU-heavy batch in a blocking task so we
-                        // don't starve the tokio runtime.
                         tokio::task::spawn_blocking(move || {
                             crate::processing::batch::process_batch(
                                 &paths,
@@ -370,10 +351,10 @@ impl App {
                 self.progress = 1.0;
                 let success_count = results.iter().filter(|r| r.success).count();
                 let fail_count = results.len() - success_count;
-                self.status_message = format!(
+                self.status_message = Cow::Owned(format!(
                     "Done — {success_count} succeeded, {fail_count} failed out of {} total",
                     results.len()
-                );
+                ));
                 self.batch_results = results;
             }
         }
@@ -410,8 +391,6 @@ impl App {
 
         column![main_row, status_bar].into()
     }
-
-    // ── Sub-views ────────────────────────────────────────────────────────
 
     fn view_sidebar(&self) -> Element<'_, Message> {
         let header = row![
@@ -474,7 +453,7 @@ impl App {
 
     fn view_preview(&self) -> Element<'_, Message> {
         let content: Element<Message> = if let Some(ref handle) = self.preview_handle {
-            iced_image(handle.clone())
+            iced_image(handle)
                 .content_fit(iced::ContentFit::Contain)
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -505,7 +484,6 @@ impl App {
                 .into()
         };
 
-        // ── Output Format ────────────────────────────────────────────
         let format_section = column![
             section_title("Output Format"),
             pick_list(
@@ -517,14 +495,12 @@ impl App {
         ]
         .spacing(4);
 
-        // ── JPEG Quality ─────────────────────────────────────────────
         let quality_section = column![
             section_title(&format!("JPEG Quality: {}%", self.quality)),
             slider(1..=100, self.quality, Message::SetQuality).width(Length::Fill),
         ]
         .spacing(4);
 
-        // ── Rotation ─────────────────────────────────────────────────
         let rotation_section = column![
             section_title("Rotation"),
             pick_list(ROTATION_OPTIONS, Some(self.rotation), Message::SetRotation)
@@ -532,7 +508,6 @@ impl App {
         ]
         .spacing(4);
 
-        // ── Text Overlay ─────────────────────────────────────────────
         let mut text_section = column![
             checkbox(self.text_enabled)
                 .label("Add Text Overlay")
@@ -585,7 +560,6 @@ impl App {
                 );
         }
 
-        // ── Output Dir ───────────────────────────────────────────────
         let output_label = if let Some(ref dir) = self.output_dir {
             dir.file_name()
                 .and_then(|n| n.to_str())
@@ -608,7 +582,6 @@ impl App {
         ]
         .spacing(4);
 
-        // ── Actions ──────────────────────────────────────────────────
         let process_button = if self.is_processing {
             button("Processing...").width(Length::Fill).padding(10)
         } else {
@@ -618,7 +591,6 @@ impl App {
                 .padding(10)
         };
 
-        // ── Results summary ──────────────────────────────────────────
         let results_section: Element<Message> = if self.batch_results.is_empty() {
             text("").into()
         } else {

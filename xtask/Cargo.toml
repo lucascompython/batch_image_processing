@@ -7,7 +7,6 @@ edition = "2024"
 clap = { version = "4", features = ["derive"] }
 
 
-[profile.fast-build]
-inherits = "dev"
+[profile.dev]
 debug = false
 strip = "debuginfo"
