@@ -5,9 +5,20 @@ use mimalloc::MiMalloc;
 static GLOBAL: MiMalloc = MiMalloc;
 
 mod app;
+mod numbering_mode;
+mod ocr;
 mod processing;
 
 fn main() {
+    // Initialize OCR engine in background (may take a moment to load models)
+    std::thread::spawn(|| {
+        if let Err(e) = ocr::init_ocr() {
+            eprintln!("OCR initialization failed: {e}");
+        } else {
+            eprintln!("OCR engine initialized successfully");
+        }
+    });
+
     let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
 
     app.run(move |cx| {

@@ -1,8 +1,7 @@
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::IndexPath;
-use gpui_component::button::Button;
-use gpui_component::button::ButtonVariants;
+use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -10,11 +9,14 @@ use gpui_component::progress::Progress;
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::select::{SelectEvent, SelectItem, SelectState};
 use gpui_component::slider::{Slider, SliderEvent, SliderState};
-use gpui_component::{ActiveTheme, Disableable, Root, Sizable, StyledExt, h_flex, v_flex};
+use gpui_component::{ActiveTheme, Disableable, Sizable, h_flex, v_flex};
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use crate::numbering_mode::NumberingMode;
 use crate::processing::batch::{BatchConfig, OutputFormat, ProcessResult};
-use crate::processing::image_ops::{self, Rotation, TextColor, TextOverlayConfig, TextPosition};
+use crate::processing::image_cache::ImageCache;
+use crate::processing::image_ops::{Rotation, TextColor, TextOverlayConfig, TextPosition};
 
 // ---------------------------------------------------------------------------
 // SelectItem wrapper
@@ -45,17 +47,34 @@ type RotationSelectState = SelectState<Vec<SelectOption<Rotation>>>;
 type PositionSelectState = SelectState<Vec<SelectOption<TextPosition>>>;
 
 // ---------------------------------------------------------------------------
+// App Mode
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AppMode {
+    BatchProcessing,
+    Numbering,
+}
+
+// ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
 
 pub struct App {
-    // Image list
+    // Current mode
+    mode: AppMode,
+    numbering_mode: Entity<NumberingMode>,
+
+    // Shared image cache
+    image_cache: Arc<ImageCache>,
+
+    // Image list (batch mode)
     image_paths: Vec<PathBuf>,
     selected_index: Option<usize>,
     preview_path: Option<PathBuf>,
     preview_version: usize,
 
-    // Settings
+    // Settings (batch mode)
     quality: u8,
     rotation: Rotation,
     output_format: OutputFormat,
@@ -90,6 +109,15 @@ pub struct App {
 
 impl App {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        // Shared image cache
+        let image_cache = Arc::new(ImageCache::new(15));
+
+        // Numbering mode entity
+        let numbering_mode = {
+            let cache = image_cache.clone();
+            cx.new(|cx| NumberingMode::new(window, cx, cache))
+        };
+
         // Quality slider: 1..100, default 70
         let quality_slider = cx.new(|_| {
             SliderState::new()
@@ -291,6 +319,10 @@ impl App {
         ));
 
         Self {
+            mode: AppMode::BatchProcessing,
+            numbering_mode,
+            image_cache,
+
             image_paths: Vec::new(),
             selected_index: None,
             preview_path: None,
@@ -324,6 +356,15 @@ impl App {
 
             _subscriptions: subs,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Mode switching
+    // -----------------------------------------------------------------------
+
+    fn set_mode(&mut self, mode: AppMode, cx: &mut Context<Self>) {
+        self.mode = mode;
+        cx.notify();
     }
 
     // -----------------------------------------------------------------------
@@ -464,35 +505,19 @@ impl App {
             None
         };
 
-        let executor = cx.background_executor().clone();
+        let cache = self.image_cache.clone();
 
-        let entity = cx.entity().downgrade();
         cx.spawn(async move |this, mut cx| {
-            let result = executor
-                .spawn(async move {
-                    let result: Option<PathBuf> = (move || {
-                        let mut img = image_ops::load_image(&path).ok()?;
-                        if rotation != Rotation::None {
-                            img = image_ops::rotate_image(&img, rotation);
-                        }
-                        let thumb = image_ops::generate_thumbnail(&img, 1200);
-                        let mut final_img = image::DynamicImage::ImageRgba8(thumb);
-                        if let Some(tc) = text_config {
-                            let filename =
-                                path.file_stem().and_then(|n| n.to_str()).unwrap_or("image");
-                            final_img = image_ops::overlay_text(final_img, &tc, filename);
-                        }
-                        let temp_path =
-                            std::env::temp_dir().join(format!("bip_preview_{version}.png"));
-                        final_img
-                            .to_rgba8()
-                            .save_with_format(&temp_path, image::ImageFormat::Png)
-                            .ok()?;
-                        Some(temp_path)
-                    })();
-                    result
-                })
-                .await;
+            // Use cache to get decoded image, then save to temp file for GPUI
+            let result: Option<PathBuf> = (|| {
+                let cached = cache.get_or_decode(&path, rotation, text_config.as_ref())?;
+                let temp_path = std::env::temp_dir().join(format!("bip_preview_{version}.png"));
+                cached
+                    .rgba
+                    .save_with_format(&temp_path, image::ImageFormat::Png)
+                    .ok()?;
+                Some(temp_path)
+            })();
 
             _ = this.update(cx, |this, cx| {
                 if version == this.preview_version {
@@ -502,6 +527,42 @@ impl App {
             });
         })
         .detach();
+
+        // Preload adjacent images in background
+        self.preload_adjacent(cx);
+    }
+
+    fn preload_adjacent(&self, cx: &mut Context<Self>) {
+        let Some(idx) = self.selected_index else {
+            return;
+        };
+
+        let paths = &self.image_paths;
+        let mut adjacent = Vec::new();
+        if idx > 0 {
+            adjacent.push(paths[idx - 1].clone());
+        }
+        if idx + 1 < paths.len() {
+            adjacent.push(paths[idx + 1].clone());
+        }
+
+        if adjacent.is_empty() {
+            return;
+        }
+
+        let cache = self.image_cache.clone();
+        let rotation = self.rotation;
+        let text_config = if self.text_enabled {
+            Some(self.build_text_config())
+        } else {
+            None
+        };
+
+        cx.background_executor()
+            .spawn(async move {
+                cache.preload(&adjacent, rotation, text_config.as_ref());
+            })
+            .detach();
     }
 
     fn build_text_config(&self) -> TextOverlayConfig {
@@ -602,7 +663,6 @@ impl App {
 
     fn render_preview(&self, _cx: &mut Context<Self>) -> impl IntoElement {
         let content = if let Some(ref preview) = self.preview_path {
-            let _path_str: SharedString = preview.to_string_lossy().to_string().into();
             div()
                 .size_full()
                 .flex()
@@ -816,41 +876,103 @@ impl App {
 
 impl Render for App {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let main_row = h_flex()
-            .flex_1()
-            .child(self.render_sidebar(cx))
-            .child(self.render_preview(cx))
-            .child(self.render_settings(cx));
+        let mode = self.mode;
+        let entity = cx.entity().clone();
+        let is_batch = mode == AppMode::BatchProcessing;
+        let is_numbering = mode == AppMode::Numbering;
 
-        let status_bar = h_flex()
-            .px_2()
-            .py_1()
-            .gap_2()
-            .items_center()
-            .bg(cx.theme().background)
-            .border_t_1()
-            .border_color(cx.theme().border)
+        // Inline tab rendering to avoid borrow issues
+        let tab_style = |active: bool, theme: &gpui_component::theme::Theme| {
+            let base = div().px_4().py_2().text_sm().cursor_pointer().border_b_2();
+            if active {
+                base.border_color(theme.accent)
+                    .text_color(theme.foreground)
+                    .font_weight(FontWeight::SEMIBOLD)
+            } else {
+                base.border_color(transparent_black())
+                    .text_color(theme.muted_foreground)
+                    .hover(|el| el.text_color(theme.foreground))
+            }
+        };
+
+        let theme = cx.theme().clone();
+        let tabs = h_flex()
+            .bg(theme.background)
+            .border_b_1()
+            .border_color(theme.border)
             .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(self.status_message.clone()),
+                tab_style(is_batch, &theme)
+                    .id("tab-batch")
+                    .child("📦 Batch Processing")
+                    .on_click({
+                        let entity = entity.clone();
+                        move |_, _, cx| {
+                            entity
+                                .update(cx, |this, cx| this.set_mode(AppMode::BatchProcessing, cx));
+                        }
+                    }),
             )
-            .child(div().flex_1())
-            .when(self.is_processing, |el| {
-                el.child(
-                    div()
-                        .w(px(200.))
-                        .child(Progress::new("progress").value(self.progress * 100.0)),
-                )
-            });
+            .child(
+                tab_style(is_numbering, &theme)
+                    .id("tab-numbering")
+                    .child("🏍️ Numbering")
+                    .on_click({
+                        let entity = entity.clone();
+                        move |_, _, cx| {
+                            entity.update(cx, |this, cx| this.set_mode(AppMode::Numbering, cx));
+                        }
+                    }),
+            );
+
+        let content = match mode {
+            AppMode::BatchProcessing => {
+                let main_row = h_flex()
+                    .flex_1()
+                    .child(self.render_sidebar(cx))
+                    .child(self.render_preview(cx))
+                    .child(self.render_settings(cx));
+
+                let status_bar = h_flex()
+                    .px_2()
+                    .py_1()
+                    .gap_2()
+                    .items_center()
+                    .bg(cx.theme().background)
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(self.status_message.clone()),
+                    )
+                    .child(div().flex_1())
+                    .when(self.is_processing, |el| {
+                        el.child(
+                            div()
+                                .w(px(200.))
+                                .child(Progress::new("progress").value(self.progress * 100.0)),
+                        )
+                    });
+
+                v_flex()
+                    .flex_1()
+                    .child(main_row)
+                    .child(status_bar)
+                    .into_any_element()
+            }
+            AppMode::Numbering => div()
+                .flex_1()
+                .child(self.numbering_mode.clone())
+                .into_any_element(),
+        };
 
         v_flex()
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .child(main_row)
-            .child(status_bar)
+            .child(tabs)
+            .child(content)
     }
 }
 

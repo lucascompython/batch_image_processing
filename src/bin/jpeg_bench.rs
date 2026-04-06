@@ -52,7 +52,8 @@ fn main() {
         for _ in 0..ITERATIONS {
             let mut out = Vec::new();
             let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, QUALITY);
-            img.write_with_encoder(encoder).expect("image encode failed");
+            img.write_with_encoder(encoder)
+                .expect("image encode failed");
         }
         let encode_elapsed = start.elapsed();
         let encode_avg_ms = encode_elapsed.as_secs_f64() * 1000.0 / ITERATIONS as f64;
@@ -77,7 +78,9 @@ fn main() {
                 .jpeg_set_out_colorspace(zune_core::colorspace::ColorSpace::RGB);
             let cursor = zune_core::bytestream::ZCursor::new(&raw_bytes[..]);
             let mut decoder = zune_jpeg::JpegDecoder::new_with_options(cursor, options);
-            decoder.decode_headers().expect("zune decode_headers failed");
+            decoder
+                .decode_headers()
+                .expect("zune decode_headers failed");
             let (w, h) = decoder.dimensions().expect("no dimensions");
             let pixels = decoder.decode().expect("zune decode failed");
             last_pixels = pixels;
