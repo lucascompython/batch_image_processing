@@ -7,6 +7,7 @@ use image::{DynamicImage, RgbaImage};
 use lru::LruCache;
 use parking_lot::Mutex;
 use rayon::prelude::*;
+use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,17 +30,21 @@ struct CacheKey {
     path: PathBuf,
     rotation: u8, // Rotation enum as u8
     max_size: u32,
-    // Text overlay affects the cache but we simplify by not including all params
-    has_text: bool,
+    overlay_signature: u64,
 }
 
 impl CacheKey {
-    fn new(path: &Path, rotation: Rotation, max_size: u32, has_text: bool) -> Self {
+    fn new(
+        path: &Path,
+        rotation: Rotation,
+        max_size: u32,
+        text_config: Option<&TextOverlayConfig>,
+    ) -> Self {
         Self {
             path: path.to_path_buf(),
             rotation: rotation as u8,
             max_size,
-            has_text,
+            overlay_signature: text_signature(text_config),
         }
     }
 }
@@ -68,7 +73,7 @@ impl ImageCache {
         rotation: Rotation,
         text_config: Option<&TextOverlayConfig>,
     ) -> Option<CachedImage> {
-        let key = CacheKey::new(path, rotation, self.max_size, text_config.is_some());
+        let key = CacheKey::new(path, rotation, self.max_size, text_config);
 
         // Check cache first
         {
@@ -142,7 +147,7 @@ impl ImageCache {
             paths
                 .into_iter()
                 .filter(|p| {
-                    let key = CacheKey::new(p, rotation, max_size, text_config.is_some());
+                    let key = CacheKey::new(p, rotation, max_size, text_config.as_ref());
                     !cache.contains(&key)
                 })
                 .collect()
@@ -157,7 +162,7 @@ impl ImageCache {
             .par_iter()
             .filter_map(|path| {
                 let cached = self.decode_image(path, rotation, text_config.as_ref())?;
-                let key = CacheKey::new(path, rotation, max_size, text_config.is_some());
+                let key = CacheKey::new(path, rotation, max_size, text_config.as_ref());
                 Some((key, cached))
             })
             .collect();
@@ -193,4 +198,21 @@ impl Default for ImageCache {
     fn default() -> Self {
         Self::new(10)
     }
+}
+
+fn text_signature(text_config: Option<&TextOverlayConfig>) -> u64 {
+    let Some(cfg) = text_config else {
+        return 0;
+    };
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    cfg.text_template.hash(&mut hasher);
+    cfg.position.hash(&mut hasher);
+    cfg.font_size.to_bits().hash(&mut hasher);
+    cfg.color.r.hash(&mut hasher);
+    cfg.color.g.hash(&mut hasher);
+    cfg.color.b.hash(&mut hasher);
+    cfg.color.a.hash(&mut hasher);
+    cfg.margin.hash(&mut hasher);
+    hasher.finish()
 }

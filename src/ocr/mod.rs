@@ -1,14 +1,29 @@
 //! OCR module for automatic motorcycle number recognition.
 //!
-//! Uses PaddleOCR models via pure-onnx-ocr-sync for digit detection.
+//! Uses PaddleOCR ONNX models via oar-ocr (ONNX Runtime backend).
 
-use image::DynamicImage;
-use pure_onnx_ocr_sync::{OcrEngine, OcrEngineBuilder};
+use image::imageops::FilterType;
+use image::{DynamicImage, GrayImage};
+use imageproc::template_matching::{MatchTemplateMethod, find_extremes, match_template_parallel};
+use oar_ocr::oarocr::{OAROCR, OAROCRBuilder};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 /// Global OCR engine instance (lazy initialized)
-static OCR_ENGINE: OnceLock<Option<OcrEngine>> = OnceLock::new();
+static OCR_ENGINE: OnceLock<Option<OAROCR>> = OnceLock::new();
+static STICKER_TEMPLATE: OnceLock<RwLock<Option<StickerTemplate>>> = OnceLock::new();
+
+const OCR_MAX_SIDE: u32 = 1800;
+const MATCH_MAX_SIDE: u32 = 900;
+const STICKER_MIN_SCORE: f32 = 0.27;
+const STICKER_SCALES: &[f32] = &[0.22, 0.34, 0.48, 0.66];
+const DEFAULT_NUMBER_ROI: NormalizedRect = NormalizedRect {
+    x: 0.58,
+    y: 0.04,
+    w: 0.38,
+    h: 0.45,
+};
 
 /// Result of OCR recognition
 #[derive(Debug, Clone)]
@@ -32,9 +47,48 @@ pub struct Detection {
 struct ModelPaths {
     det_model: PathBuf,
     rec_model: PathBuf,
-    text_line_ori_model: PathBuf,
-    doc_ori_model: PathBuf,
     dictionary: PathBuf,
+    text_line_ori_model: Option<PathBuf>,
+    doc_ori_model: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct StickerTemplate {
+    path: PathBuf,
+    grayscale: GrayImage,
+    number_roi: NormalizedRect,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NormalizedRect {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MatchRect {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    score: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PixelRect {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CandidateStats {
+    max_confidence: f32,
+    count: usize,
+    template_hits: usize,
 }
 
 /// Initialize the OCR engine (call once at startup)
@@ -49,15 +103,19 @@ pub fn init_ocr() -> Result<(), String> {
             }
         };
 
-        let builder = OcrEngineBuilder::new()
-            .det_model_path(&paths.det_model)
-            .rec_model_path(&paths.rec_model)
-            .text_line_ori_model_path(&paths.text_line_ori_model)
-            .doc_ori_model_path(&paths.doc_ori_model)
-            .dictionary_path(&paths.dictionary)
-            .det_limit_side_len(960)
-            .det_unclip_ratio(1.5)
-            .rec_batch_size(8);
+        let mut builder = OAROCRBuilder::new(&paths.det_model, &paths.rec_model, &paths.dictionary);
+
+        if let Some(model) = paths.doc_ori_model.as_ref() {
+            builder = builder.with_document_image_orientation_classification(model);
+        } else {
+            eprintln!("OCR: doc orientation model not found, continuing without it");
+        }
+
+        if let Some(model) = paths.text_line_ori_model.as_ref() {
+            builder = builder.with_text_line_orientation_classification(model);
+        } else {
+            eprintln!("OCR: text-line orientation model not found, continuing without it");
+        }
 
         match builder.build() {
             Ok(engine) => {
@@ -78,39 +136,94 @@ pub fn init_ocr() -> Result<(), String> {
     }
 }
 
+/// Set a sticker template image to bias OCR toward the current event sticker.
+pub fn set_sticker_template(path: &Path) -> Result<(), String> {
+    let img = crate::processing::image_ops::load_image(path)?;
+    let grayscale = prepare_template_image(&img);
+
+    if grayscale.width() < 24 || grayscale.height() < 16 {
+        return Err("Sticker template is too small".into());
+    }
+
+    let template = StickerTemplate {
+        path: path.to_path_buf(),
+        number_roi: infer_number_roi(&img),
+        grayscale,
+    };
+
+    let mut lock = sticker_template_store()
+        .write()
+        .map_err(|_| "Failed to update sticker template".to_string())?;
+    *lock = Some(template);
+    Ok(())
+}
+
+/// Clear the current sticker template.
+pub fn clear_sticker_template() {
+    if let Ok(mut lock) = sticker_template_store().write() {
+        *lock = None;
+    }
+}
+
+/// Get the loaded sticker template filename (if any).
+pub fn sticker_template_name() -> Option<String> {
+    let lock = sticker_template_store().read().ok()?;
+    lock.as_ref()?
+        .path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string())
+}
+
+/// Check whether a sticker template is loaded.
+pub fn has_sticker_template() -> bool {
+    sticker_template_store()
+        .read()
+        .map(|lock| lock.is_some())
+        .unwrap_or(false)
+}
+
 /// Run OCR on an image and extract likely motorcycle numbers.
 ///
 /// Returns the best candidate number with confidence score.
 pub fn recognize_number(img: &DynamicImage) -> Option<OcrResult> {
     let engine = OCR_ENGINE.get()?.as_ref()?;
-    let results = engine.run_from_image(img).ok()?;
+    let resized = resize_for_ocr(img, OCR_MAX_SIDE);
+    let working_img = resized.as_ref().unwrap_or(img);
 
-    if results.is_empty() {
-        return None;
+    let mut grouped: HashMap<String, CandidateStats> = HashMap::new();
+    let mut all_detections: Vec<Detection> = Vec::new();
+
+    let template_crops = sticker_guided_crops(working_img);
+    for crop in &template_crops {
+        merge_detections(
+            run_ocr_detections(engine, crop),
+            true,
+            &mut grouped,
+            &mut all_detections,
+        );
     }
 
-    // Collect all detections
-    let all_detections: Vec<Detection> = results
-        .iter()
-        .map(|r| Detection {
-            text: r.text.clone(),
-            confidence: r.confidence,
-        })
-        .collect();
+    // If template-guided OCR found nothing usable, fallback to the full image.
+    if grouped.is_empty() {
+        merge_detections(
+            run_ocr_detections(engine, working_img),
+            false,
+            &mut grouped,
+            &mut all_detections,
+        );
+    }
 
-    // Find the best candidate that looks like a motorcycle number
-    // (numeric, possibly with some letters, reasonable length 1-4 digits typically)
-    let best_number = results
-        .iter()
-        .filter_map(|result| {
-            let digits = digits_only(&result.text);
-            if (1..=4).contains(&digits.len()) {
-                Some((digits, result.confidence))
-            } else {
-                None
-            }
+    let best_number = grouped
+        .into_iter()
+        .max_by(|(digits_a, a), (digits_b, b)| {
+            let score_a =
+                candidate_score(digits_a.len(), a.max_confidence, a.count, a.template_hits);
+            let score_b =
+                candidate_score(digits_b.len(), b.max_confidence, b.count, b.template_hits);
+            score_a.total_cmp(&score_b)
         })
-        .max_by(|a, b| a.1.total_cmp(&b.1));
+        .map(|(digits, stats)| (digits, stats.max_confidence));
 
     best_number.map(|(text, confidence)| OcrResult {
         text,
@@ -119,9 +232,328 @@ pub fn recognize_number(img: &DynamicImage) -> Option<OcrResult> {
     })
 }
 
+fn resize_for_ocr(img: &DynamicImage, max_side: u32) -> Option<DynamicImage> {
+    let max_dim = img.width().max(img.height());
+    if max_dim <= max_side {
+        return None;
+    }
+
+    let scale = max_side as f32 / max_dim as f32;
+    let target_w = ((img.width() as f32 * scale).round() as u32).max(1);
+    let target_h = ((img.height() as f32 * scale).round() as u32).max(1);
+    Some(img.resize(target_w, target_h, FilterType::Triangle))
+}
+
+fn run_ocr_detections(engine: &OAROCR, img: &DynamicImage) -> Vec<Detection> {
+    let Ok(results) = engine.predict(vec![img.to_rgb8()]) else {
+        return Vec::new();
+    };
+    let Some(result) = results.first() else {
+        return Vec::new();
+    };
+
+    result
+        .text_regions
+        .iter()
+        .filter_map(|region| {
+            region
+                .text_with_confidence()
+                .map(|(text, confidence)| Detection {
+                    text: text.to_string(),
+                    confidence,
+                })
+        })
+        .collect()
+}
+
+fn merge_detections(
+    detections: Vec<Detection>,
+    from_template: bool,
+    grouped: &mut HashMap<String, CandidateStats>,
+    all_detections: &mut Vec<Detection>,
+) {
+    all_detections.extend(detections.iter().cloned());
+
+    for detection in detections {
+        let digits = digits_only(&detection.text);
+        if !(1..=6).contains(&digits.len()) {
+            continue;
+        }
+
+        let entry = grouped.entry(digits).or_default();
+        entry.max_confidence = entry.max_confidence.max(detection.confidence);
+        entry.count += 1;
+        if from_template {
+            entry.template_hits += 1;
+        }
+    }
+}
+
+fn candidate_score(len: usize, confidence: f32, count: usize, template_hits: usize) -> f32 {
+    let len_bonus = match len {
+        1 => 0.05,
+        2 => 0.09,
+        3 => 0.08,
+        4 => 0.06,
+        5 => 0.03,
+        6 => 0.01,
+        _ => 0.0,
+    };
+    let repeat_bonus = ((count.saturating_sub(1)) as f32 * 0.03).min(0.12);
+    let template_bonus = ((template_hits as f32) * 0.10).min(0.35);
+    confidence + len_bonus + repeat_bonus + template_bonus
+}
+
 /// Check if OCR is available
 pub fn is_ocr_available() -> bool {
     OCR_ENGINE.get().map(|e| e.is_some()).unwrap_or(false)
+}
+
+fn sticker_guided_crops(img: &DynamicImage) -> Vec<DynamicImage> {
+    let Some(template) = sticker_template_store()
+        .read()
+        .ok()
+        .and_then(|lock| lock.clone())
+    else {
+        return Vec::new();
+    };
+
+    let input_gray = img.to_luma8();
+    let (search_gray, scale_to_search) = downscale_for_matching(&input_gray, MATCH_MAX_SIDE);
+
+    let Some(matched) = best_template_match(&search_gray, &template.grayscale) else {
+        return Vec::new();
+    };
+
+    if matched.score < STICKER_MIN_SCORE {
+        return Vec::new();
+    }
+
+    let inv_scale = if scale_to_search > 0.0 {
+        1.0 / scale_to_search
+    } else {
+        1.0
+    };
+    let img_w = img.width();
+    let img_h = img.height();
+
+    let Some(sticker_rect) = clamp_rect(
+        matched.x as f32 * inv_scale,
+        matched.y as f32 * inv_scale,
+        matched.w as f32 * inv_scale,
+        matched.h as f32 * inv_scale,
+        img_w,
+        img_h,
+    ) else {
+        return Vec::new();
+    };
+
+    let mut crops: Vec<DynamicImage> = Vec::new();
+    let mut seen: Vec<(u32, u32, u32, u32)> = Vec::new();
+
+    let roi = template.number_roi;
+    let roi_x = sticker_rect.x as f32 + roi.x * sticker_rect.w as f32;
+    let roi_y = sticker_rect.y as f32 + roi.y * sticker_rect.h as f32;
+    let roi_w = roi.w * sticker_rect.w as f32;
+    let roi_h = roi.h * sticker_rect.h as f32;
+
+    let candidate_rects = [
+        clamp_rect(
+            roi_x - roi_w * 0.30,
+            roi_y - roi_h * 0.30,
+            roi_w * 1.60,
+            roi_h * 1.70,
+            img_w,
+            img_h,
+        ),
+        clamp_rect(
+            roi_x - roi_w * 0.45,
+            roi_y - roi_h * 0.45,
+            roi_w * 1.95,
+            roi_h * 2.00,
+            img_w,
+            img_h,
+        ),
+        clamp_rect(
+            sticker_rect.x as f32 - sticker_rect.w as f32 * 0.10,
+            sticker_rect.y as f32 - sticker_rect.h as f32 * 0.10,
+            sticker_rect.w as f32 * 1.20,
+            sticker_rect.h as f32 * 1.20,
+            img_w,
+            img_h,
+        ),
+    ];
+
+    for rect in candidate_rects.into_iter().flatten() {
+        let key = (rect.x, rect.y, rect.w, rect.h);
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        crops.push(img.crop_imm(rect.x, rect.y, rect.w, rect.h));
+    }
+
+    crops
+}
+
+fn best_template_match(image: &GrayImage, template: &GrayImage) -> Option<MatchRect> {
+    let mut best: Option<MatchRect> = None;
+
+    for scale in STICKER_SCALES {
+        let tw = ((template.width() as f32 * scale).round() as u32).max(1);
+        let th = ((template.height() as f32 * scale).round() as u32).max(1);
+
+        if tw < 20 || th < 14 || tw >= image.width() || th >= image.height() {
+            continue;
+        }
+
+        let resized_template = image::imageops::resize(template, tw, th, FilterType::Triangle);
+        if resized_template.width() >= image.width() || resized_template.height() >= image.height()
+        {
+            continue;
+        }
+
+        let result = match_template_parallel(
+            image,
+            &resized_template,
+            MatchTemplateMethod::CrossCorrelationNormalized,
+        );
+        let extremes = find_extremes(&result);
+
+        let candidate = MatchRect {
+            x: extremes.max_value_location.0,
+            y: extremes.max_value_location.1,
+            w: resized_template.width(),
+            h: resized_template.height(),
+            score: extremes.max_value,
+        };
+
+        if best
+            .map(|current| candidate.score > current.score)
+            .unwrap_or(true)
+        {
+            best = Some(candidate);
+        }
+    }
+
+    best
+}
+
+fn downscale_for_matching(gray: &GrayImage, max_side: u32) -> (GrayImage, f32) {
+    let max_dim = gray.width().max(gray.height());
+    if max_dim <= max_side {
+        return (gray.clone(), 1.0);
+    }
+
+    let scale = max_side as f32 / max_dim as f32;
+    let target_w = ((gray.width() as f32 * scale).round() as u32).max(1);
+    let target_h = ((gray.height() as f32 * scale).round() as u32).max(1);
+    (
+        image::imageops::resize(gray, target_w, target_h, FilterType::Triangle),
+        scale,
+    )
+}
+
+fn prepare_template_image(template: &DynamicImage) -> GrayImage {
+    let gray = template.to_luma8();
+    let max_dim = gray.width().max(gray.height());
+    if max_dim <= 900 {
+        gray
+    } else {
+        let scale = 900.0 / max_dim as f32;
+        let w = ((gray.width() as f32 * scale).round() as u32).max(1);
+        let h = ((gray.height() as f32 * scale).round() as u32).max(1);
+        image::imageops::resize(&gray, w, h, FilterType::Triangle)
+    }
+}
+
+fn infer_number_roi(template: &DynamicImage) -> NormalizedRect {
+    let rgb = template.to_rgb8();
+    let (w, h) = rgb.dimensions();
+    if w < 8 || h < 8 {
+        return DEFAULT_NUMBER_ROI;
+    }
+
+    let mut min_x = w;
+    let mut min_y = h;
+    let mut max_x = 0;
+    let mut max_y = 0;
+    let mut blue_pixels = 0usize;
+
+    for (x, y, px) in rgb.enumerate_pixels() {
+        let [r, g, b] = px.0;
+        let max = r.max(g).max(b);
+        let min = r.min(g).min(b);
+        let saturation = max.saturating_sub(min);
+
+        let likely_blue =
+            b > 70 && b > r.saturating_add(18) && b > g.saturating_add(10) && saturation > 28;
+        if !likely_blue {
+            continue;
+        }
+
+        blue_pixels += 1;
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    }
+
+    if blue_pixels < 24 || min_x > max_x || min_y > max_y {
+        return DEFAULT_NUMBER_ROI;
+    }
+
+    let bw = (max_x - min_x + 1) as f32;
+    let bh = (max_y - min_y + 1) as f32;
+    let x = clamp01((min_x as f32 - bw * 0.12) / w as f32);
+    let y = clamp01((min_y as f32 - bh * 0.12) / h as f32);
+    let x2 = clamp01((max_x as f32 + 1.0 + bw * 0.12) / w as f32);
+    let y2 = clamp01((max_y as f32 + 1.0 + bh * 0.12) / h as f32);
+
+    let roi = NormalizedRect {
+        x,
+        y,
+        w: (x2 - x).max(0.08),
+        h: (y2 - y).max(0.08),
+    };
+
+    if roi.w <= 0.0 || roi.h <= 0.0 {
+        DEFAULT_NUMBER_ROI
+    } else {
+        roi
+    }
+}
+
+fn clamp_rect(x: f32, y: f32, w: f32, h: f32, img_w: u32, img_h: u32) -> Option<PixelRect> {
+    if w <= 1.0 || h <= 1.0 || img_w == 0 || img_h == 0 {
+        return None;
+    }
+
+    let x0 = x.max(0.0).min(img_w.saturating_sub(1) as f32);
+    let y0 = y.max(0.0).min(img_h.saturating_sub(1) as f32);
+    let x1 = (x + w).max(x0 + 1.0).min(img_w as f32);
+    let y1 = (y + h).max(y0 + 1.0).min(img_h as f32);
+
+    let cw = (x1 - x0).floor() as u32;
+    let ch = (y1 - y0).floor() as u32;
+    if cw < 2 || ch < 2 {
+        return None;
+    }
+
+    Some(PixelRect {
+        x: x0.floor() as u32,
+        y: y0.floor() as u32,
+        w: cw,
+        h: ch,
+    })
+}
+
+fn clamp01(v: f32) -> f32 {
+    v.clamp(0.0, 1.0)
+}
+
+fn sticker_template_store() -> &'static RwLock<Option<StickerTemplate>> {
+    STICKER_TEMPLATE.get_or_init(|| RwLock::new(None))
 }
 
 fn model_dir() -> PathBuf {
@@ -133,32 +565,28 @@ fn model_dir() -> PathBuf {
 fn resolve_model_paths(model_dir: &Path) -> Result<ModelPaths, String> {
     let det_model = find_existing(model_dir, "detection model", &["det.onnx"])?;
     let rec_model = find_existing(model_dir, "recognition model", &["rec.onnx"])?;
-    let text_line_ori_model = find_existing(
-        model_dir,
-        "text-line orientation model",
-        &[
-            "PP-LCNet_x0_25_textline_ori.onnx",
-            "textline_ori.onnx",
-            "text_line_ori.onnx",
-        ],
-    )?;
-    let doc_ori_model = find_existing(
-        model_dir,
-        "document orientation model",
-        &["PP-LCNet_x1_0_doc_ori.onnx", "doc_ori.onnx"],
-    )?;
     let dictionary = find_existing(
         model_dir,
         "OCR dictionary",
         &["ppocrv5_dict.txt", "dict.txt"],
     )?;
 
+    let text_line_ori_model = find_optional(
+        model_dir,
+        &[
+            "PP-LCNet_x0_25_textline_ori.onnx",
+            "textline_ori.onnx",
+            "text_line_ori.onnx",
+        ],
+    );
+    let doc_ori_model = find_optional(model_dir, &["PP-LCNet_x1_0_doc_ori.onnx", "doc_ori.onnx"]);
+
     Ok(ModelPaths {
         det_model,
         rec_model,
+        dictionary,
         text_line_ori_model,
         doc_ori_model,
-        dictionary,
     })
 }
 
@@ -175,6 +603,16 @@ fn find_existing(model_dir: &Path, label: &str, candidates: &[&str]) -> Result<P
         model_dir.display(),
         candidates.join(", ")
     ))
+}
+
+fn find_optional(model_dir: &Path, candidates: &[&str]) -> Option<PathBuf> {
+    for name in candidates {
+        let path = model_dir.join(name);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
 }
 
 fn digits_only(text: &str) -> String {

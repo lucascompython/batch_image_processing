@@ -1,0 +1,3 @@
+- [ ] in processing mode fix images being bigger than the window
+- [ ] improve perofmrance for text overlay preview, probably by not doing the full processing pipeline and just doing the text overlay part
+- [ ] improve OCR accuracy and performance, expecially with a sticker template

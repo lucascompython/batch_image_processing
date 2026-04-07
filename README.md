@@ -22,3 +22,10 @@ The app can suggest motorcycle numbers using local ONNX OCR.
    - `ppocrv5_dict.txt`
 
 If these files are missing, the app still runs, but OCR suggestions stay disabled.
+
+### Sticker template assist (Numbering mode)
+
+You can load an event sticker template from the Numbering toolbar (`Sticker Template` button).
+When loaded, OCR first tries to locate that sticker in each photo and prioritizes the number area
+of that sticker before falling back to full-image OCR. This helps reduce confusion with old-event
+stickers that appear in the same frame.

@@ -217,7 +217,7 @@ impl App {
             state.set_value("{filename}", window, cx);
         });
 
-        // Color picker — default white
+        // Color picker - default white
         let color_picker =
             cx.new(|cx| ColorPickerState::new(window, cx).default_value(hsla(0.0, 0.0, 1.0, 1.0)));
 
@@ -342,7 +342,7 @@ impl App {
 
             is_processing: false,
             progress: 0.0,
-            status_message: "Ready — Open a folder to begin".into(),
+            status_message: "Ready - Open a folder to begin".into(),
             batch_results: Vec::new(),
 
             quality_slider,
@@ -479,7 +479,7 @@ impl App {
                 let success = results.iter().filter(|r| r.success).count();
                 let fail = results.len() - success;
                 this.status_message = format!(
-                    "Done — {success} succeeded, {fail} failed out of {} total",
+                    "Done - {success} succeeded, {fail} failed out of {} total",
                     results.len()
                 )
                 .into();
@@ -508,12 +508,16 @@ impl App {
         let cache = self.image_cache.clone();
 
         cx.spawn(async move |this, mut cx| {
-            // Use cache to get decoded image, then save to temp file for GPUI
+            // Use cache for base decode/rotation. Apply text overlay from current settings.
             let result: Option<PathBuf> = (|| {
-                let cached = cache.get_or_decode(&path, rotation, text_config.as_ref())?;
+                let cached = cache.get_or_decode(&path, rotation, None)?;
+                let mut preview = image::DynamicImage::ImageRgba8((*cached.rgba).clone());
+                if let Some(cfg) = text_config.as_ref() {
+                    let filename = path.file_stem().and_then(|n| n.to_str()).unwrap_or("image");
+                    preview = crate::processing::image_ops::overlay_text(preview, cfg, filename);
+                }
                 let temp_path = std::env::temp_dir().join(format!("bip_preview_{version}.png"));
-                cached
-                    .rgba
+                preview
                     .save_with_format(&temp_path, image::ImageFormat::Png)
                     .ok()?;
                 Some(temp_path)
@@ -552,15 +556,10 @@ impl App {
 
         let cache = self.image_cache.clone();
         let rotation = self.rotation;
-        let text_config = if self.text_enabled {
-            Some(self.build_text_config())
-        } else {
-            None
-        };
 
         cx.background_executor()
             .spawn(async move {
-                cache.preload(&adjacent, rotation, text_config.as_ref());
+                cache.preload(&adjacent, rotation, None);
             })
             .detach();
     }
@@ -661,7 +660,7 @@ impl App {
             .child(file_list)
     }
 
-    fn render_preview(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_preview(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let content = if let Some(ref preview) = self.preview_path {
             div()
                 .size_full()
@@ -686,13 +685,19 @@ impl App {
                 .child(
                     div()
                         .text_base()
-                        .text_color(gpui::hsla(0., 0., 0.4, 1.0))
+                        .text_color(cx.theme().muted_foreground)
                         .child("Select an image to preview"),
                 )
                 .into_any_element()
         };
 
-        div().flex_1().h_full().p_1().child(content)
+        div()
+            .flex_1()
+            .min_w(px(0.))
+            .h_full()
+            .p_1()
+            .overflow_hidden()
+            .child(content)
     }
 
     fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -701,7 +706,7 @@ impl App {
             div()
                 .text_sm()
                 .font_weight(FontWeight::MEDIUM)
-                .text_color(cx.theme().accent)
+                .text_color(cx.theme().foreground)
                 .child(label.to_string())
                 .into_any_element()
         };
@@ -903,7 +908,7 @@ impl Render for App {
             .child(
                 tab_style(is_batch, &theme)
                     .id("tab-batch")
-                    .child("📦 Batch Processing")
+                    .child("Batch Processing")
                     .on_click({
                         let entity = entity.clone();
                         move |_, _, cx| {
@@ -915,7 +920,7 @@ impl Render for App {
             .child(
                 tab_style(is_numbering, &theme)
                     .id("tab-numbering")
-                    .child("🏍️ Numbering")
+                    .child("Numbering")
                     .on_click({
                         let entity = entity.clone();
                         move |_, _, cx| {
@@ -928,6 +933,8 @@ impl Render for App {
             AppMode::BatchProcessing => {
                 let main_row = h_flex()
                     .flex_1()
+                    .min_w(px(0.))
+                    .overflow_x_scrollbar()
                     .child(self.render_sidebar(cx))
                     .child(self.render_preview(cx))
                     .child(self.render_settings(cx));

@@ -1,5 +1,6 @@
 use ab_glyph::{FontRef, PxScale};
-use image::{DynamicImage, ImageReader, RgbaImage};
+use image::metadata::Orientation;
+use image::{DynamicImage, ImageDecoder, ImageReader, RgbaImage};
 use imageproc::drawing::{draw_text_mut, text_size};
 use pdf_writer::{Content, Finish, Name, Pdf, Rect, Ref};
 use std::path::Path;
@@ -14,7 +15,7 @@ pub enum Rotation {
 }
 
 /// Where to place the text overlay on the image.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TextPosition {
     TopLeft,
     TopRight,
@@ -73,28 +74,45 @@ const EMBEDDED_FONT: &[u8] = include_bytes!("../assets/Inter-Regular.ttf");
 /// # Errors
 /// Returns an error if the file cannot be read or decoded.
 pub fn load_image(path: &Path) -> Result<DynamicImage, String> {
+    let orientation = read_image_orientation(path);
     let raw = std::fs::read(path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
 
-    // Try turbojpeg (libjpeg-turbo) first — blazing fast SIMD decode
-    if let Ok(img) = turbojpeg::decompress(&raw, turbojpeg::PixelFormat::RGBA) {
-        if let Some(rgba) = RgbaImage::from_raw(img.width as u32, img.height as u32, img.pixels) {
-            return Ok(DynamicImage::ImageRgba8(rgba));
-        }
+    if let Ok(img) = turbojpeg::decompress(&raw, turbojpeg::PixelFormat::RGBA)
+        && let Some(rgba) = RgbaImage::from_raw(img.width as u32, img.height as u32, img.pixels)
+    {
+        let mut out = DynamicImage::ImageRgba8(rgba);
+        out.apply_orientation(orientation);
+        return Ok(out);
     }
 
-    println!("Failed to decode {}", path.display());
-
-    // Fallback to generic `image` crate decoder if it's a PNG or fails
-    ImageReader::open(path)
+    // fallback to generic `image` crate decoder if it's a PNG or if turbojpeg fails.
+    let mut decoder = ImageReader::open(path)
         .map_err(|e| format!("Failed to open {}: {e}", path.display()))?
-        .decode()
-        .map_err(|e| format!("Failed to decode {}: {e}", path.display()))
+        .with_guessed_format()
+        .map_err(|e| format!("Failed to guess format for {}: {e}", path.display()))?
+        .into_decoder()
+        .map_err(|e| format!("Failed to create decoder {}: {e}", path.display()))?;
+
+    let orientation = decoder.orientation().unwrap_or(orientation);
+    let mut img = DynamicImage::from_decoder(decoder)
+        .map_err(|e| format!("Failed to decode {}: {e}", path.display()))?;
+    img.apply_orientation(orientation);
+    Ok(img)
 }
 
-/// Save a `DynamicImage` as JPEG with the given quality (0-100).
-///
-/// # Errors
-/// Returns an error if the file cannot be created or encoded.
+fn read_image_orientation(path: &Path) -> Orientation {
+    let Ok(reader) = ImageReader::open(path) else {
+        return Orientation::NoTransforms;
+    };
+    let Ok(reader) = reader.with_guessed_format() else {
+        return Orientation::NoTransforms;
+    };
+    let Ok(mut decoder) = reader.into_decoder() else {
+        return Orientation::NoTransforms;
+    };
+    decoder.orientation().unwrap_or(Orientation::NoTransforms)
+}
+
 pub fn save_jpeg(img: &DynamicImage, path: &Path, quality: u8) -> Result<(), String> {
     let rgb = img.to_rgb8();
     let (w, h) = (rgb.width(), rgb.height());
@@ -205,7 +223,7 @@ pub fn overlay_text(img: DynamicImage, config: &TextOverlayConfig, filename: &st
 }
 
 /// Generate a thumbnail that fits within `max_size` pixels on the longest side.
-/// Uses Triangle (bilinear) filter — ~3x faster than the default Lanczos3,
+/// Uses Triangle (bilinear) filter - ~3x faster than the default Lanczos3,
 /// visually identical at preview sizes.
 pub fn generate_thumbnail(img: &DynamicImage, max_size: u32) -> RgbaImage {
     img.resize(max_size, max_size, image::imageops::FilterType::Triangle)

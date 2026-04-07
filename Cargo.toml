@@ -22,8 +22,8 @@ mimalloc = { version = "0.1", features = ["v3"] }
 lru = "0.16"
 parking_lot = "0.12"
 
-# OCR (pure Rust, no system dependencies)
-pure-onnx-ocr-sync = "0.2"
+# OCR (ONNX Runtime backend)
+oar-ocr = "0.6.2"
 
 # benchmark-only dependencies (behind 'bench' feature)
 zune-jpeg = { version = "0.5", optional = true }

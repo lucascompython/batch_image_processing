@@ -3,7 +3,7 @@
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::{ActiveTheme, Sizable, h_flex, v_flex};
+use gpui_component::{ActiveTheme, ElementExt, Sizable, h_flex, v_flex};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -15,7 +15,9 @@ pub struct NumberingMode {
     state: NumberingState,
     input_state: Entity<InputState>,
     image_cache: Arc<ImageCache>,
-    preview_path: Option<PathBuf>,
+    preview_image: Option<Arc<Image>>,
+    preview_dimensions: Option<(u32, u32)>,
+    image_view_size: Option<(f32, f32)>,
     preview_version: usize,
     _subscriptions: Vec<Subscription>,
 }
@@ -43,7 +45,9 @@ impl NumberingMode {
             state: NumberingState::new(),
             input_state,
             image_cache,
-            preview_path: None,
+            preview_image: None,
+            preview_dimensions: None,
+            image_view_size: None,
             preview_version: 0,
             _subscriptions: subs,
         }
@@ -92,70 +96,151 @@ impl NumberingMode {
         .detach();
     }
 
+    fn open_sticker_template(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let entity = cx.entity().clone();
+        cx.spawn_in(window, async move |_this, mut cx| {
+            let handle = rfd::AsyncFileDialog::new()
+                .set_title("Select event sticker template")
+                .add_filter("Images", &["png", "jpg", "jpeg"])
+                .pick_file()
+                .await;
+
+            if let Some(file) = handle {
+                let path = file.path().to_path_buf();
+                let load_result = crate::ocr::set_sticker_template(&path);
+
+                _ = entity.update(cx, |this, cx| {
+                    match load_result {
+                        Ok(()) => {
+                            let label = path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("template");
+                            this.state.status_message = format!("Sticker template loaded: {label}");
+                            this.load_current_image(cx);
+                        }
+                        Err(err) => {
+                            this.state.status_message = format!("Template load failed: {err}");
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn clear_sticker_template(&mut self, cx: &mut Context<Self>) {
+        crate::ocr::clear_sticker_template();
+        self.state.status_message = "Sticker template cleared".into();
+        self.load_current_image(cx);
+        cx.notify();
+    }
+
     fn load_current_image(&mut self, cx: &mut Context<Self>) {
         if let Some(path) = self.state.current_image().cloned() {
             self.preview_version = self.preview_version.wrapping_add(1);
             let version = self.preview_version;
             let cache = self.image_cache.clone();
-            let ocr_path = path.clone();
+            let ocr_enabled = crate::ocr::is_ocr_available();
+            let preview_path = path.clone();
+            self.state.pan_x = 0.0;
+            self.state.pan_y = 0.0;
+            self.state.is_dragging = false;
 
             // Mark OCR as running
-            self.state.ocr_running = true;
+            self.state.ocr_running = ocr_enabled;
             self.state.ocr_suggestion = None;
 
+            // Load and present preview as soon as possible.
             cx.spawn(async move |this, cx| {
-                // Use cache to get or decode image, then save to temp file for GPUI
-                let (preview_result, ocr_result) = {
+                let still_current = this
+                    .update(cx, |this, _| version == this.preview_version)
+                    .unwrap_or(false);
+                if !still_current {
+                    return;
+                }
+
+                let (preview, dimensions) = {
                     let cached = cache.get_or_decode(
-                        &path,
+                        &preview_path,
                         crate::processing::image_ops::Rotation::None,
                         None,
                     );
 
-                    let preview = cached.as_ref().and_then(|c| {
-                        let temp_path =
-                            std::env::temp_dir().join(format!("bip_num_preview_{version}.png"));
-                        c.rgba
-                            .save_with_format(&temp_path, image::ImageFormat::Png)
+                    cached
+                        .as_ref()
+                        .and_then(|c| {
+                            let mut bytes = Vec::new();
+                            let encoder = image::codecs::png::PngEncoder::new_with_quality(
+                                &mut bytes,
+                                image::codecs::png::CompressionType::Fast,
+                                image::codecs::png::FilterType::NoFilter,
+                            );
+                            image::ImageEncoder::write_image(
+                                encoder,
+                                c.rgba.as_raw(),
+                                c.rgba.width(),
+                                c.rgba.height(),
+                                image::ColorType::Rgba8.into(),
+                            )
                             .ok()?;
-                        Some(temp_path)
-                    });
-
-                    // Run OCR on the full image (not thumbnail)
-                    let ocr = if crate::ocr::is_ocr_available() {
-                        if let Ok(img) = crate::processing::image_ops::load_image(&ocr_path) {
-                            crate::ocr::recognize_number(&img)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-
-                    (preview, ocr)
+                            Some((
+                                Arc::new(Image::from_bytes(gpui::ImageFormat::Png, bytes)),
+                                (c.rgba.width(), c.rgba.height()),
+                            ))
+                        })
+                        .map_or((None, None), |(img, dims)| (Some(img), Some(dims)))
                 };
 
                 _ = this.update(cx, |this, cx| {
                     if version == this.preview_version {
-                        this.preview_path = preview_result;
-                        this.state.ocr_running = false;
-
-                        if let Some(ocr) = ocr_result {
-                            this.state.ocr_suggestion = Some(super::state::OcrSuggestion {
-                                number: ocr.text,
-                                confidence: ocr.confidence,
-                            });
-                        }
+                        this.preview_image = preview;
+                        this.preview_dimensions = dimensions;
                     }
                     cx.notify();
                 });
             })
             .detach();
 
+            // OCR runs independently so image transitions stay snappy.
+            if ocr_enabled {
+                let ocr_path = path.clone();
+                cx.spawn(async move |this, cx| {
+                    let still_current = this
+                        .update(cx, |this, _| version == this.preview_version)
+                        .unwrap_or(false);
+                    if !still_current {
+                        return;
+                    }
+
+                    let ocr = crate::processing::image_ops::load_image(&ocr_path)
+                        .ok()
+                        .and_then(|img| crate::ocr::recognize_number(&img));
+
+                    _ = this.update(cx, |this, cx| {
+                        if version == this.preview_version {
+                            this.state.ocr_running = false;
+                            this.state.ocr_suggestion =
+                                ocr.map(|value| super::state::OcrSuggestion {
+                                    number: value.text,
+                                    confidence: value.confidence,
+                                });
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
+            } else {
+                self.state.ocr_running = false;
+            }
+
             // Preload adjacent images
             self.preload_adjacent(cx);
         } else {
-            self.preview_path = None;
+            self.preview_image = None;
+            self.preview_dimensions = None;
+            self.state.ocr_running = false;
             cx.notify();
         }
     }
@@ -165,11 +250,13 @@ impl NumberingMode {
             let idx = self.state.current_index;
             let paths = &self.state.image_paths;
             let mut adj = Vec::new();
-            if idx > 0 {
-                adj.push(paths[idx - 1].clone());
-            }
-            if idx + 1 < paths.len() {
-                adj.push(paths[idx + 1].clone());
+            for offset in 1..=2 {
+                if idx >= offset {
+                    adj.push(paths[idx - offset].clone());
+                }
+                if idx + offset < paths.len() {
+                    adj.push(paths[idx + offset].clone());
+                }
             }
             adj
         };
@@ -240,7 +327,84 @@ impl NumberingMode {
         } else {
             self.state.zoom_out();
         }
+
+        if let Some((base_w, base_h)) = self.preview_dimensions {
+            let (max_x, max_y) = self.pan_limits(base_w as f32, base_h as f32);
+            self.state.pan_x = self.state.pan_x.clamp(-max_x, max_x);
+            self.state.pan_y = self.state.pan_y.clamp(-max_y, max_y);
+        }
+
+        if self.state.zoom_level <= 1.01 {
+            self.state.pan_x = 0.0;
+            self.state.pan_y = 0.0;
+            self.state.is_dragging = false;
+        }
         cx.notify();
+    }
+
+    fn fitted_size(&self, base_w: f32, base_h: f32) -> (f32, f32) {
+        let (view_w, view_h) = self.image_view_size.unwrap_or((base_w, base_h));
+        if base_w <= 0.0 || base_h <= 0.0 || view_w <= 0.0 || view_h <= 0.0 {
+            return (base_w.max(1.0), base_h.max(1.0));
+        }
+
+        let fit_scale = (view_w / base_w).min(view_h / base_h);
+        (base_w * fit_scale, base_h * fit_scale)
+    }
+
+    fn pan_limits(&self, base_w: f32, base_h: f32) -> (f32, f32) {
+        if self.state.zoom_level <= 1.01 {
+            return (0.0, 0.0);
+        }
+
+        let (fit_w, fit_h) = self.fitted_size(base_w, base_h);
+        let scaled_w = fit_w * self.state.zoom_level;
+        let scaled_h = fit_h * self.state.zoom_level;
+        (
+            ((scaled_w - fit_w) * 0.5).max(0.0),
+            ((scaled_h - fit_h) * 0.5).max(0.0),
+        )
+    }
+
+    fn start_pan(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        if self.state.zoom_level <= 1.01 {
+            return;
+        }
+        self.state.is_dragging = true;
+        self.state.drag_start_x = event.position.x.as_f32();
+        self.state.drag_start_y = event.position.y.as_f32();
+        cx.notify();
+    }
+
+    fn handle_pan_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if !self.state.is_dragging {
+            return;
+        }
+
+        let x = event.position.x.as_f32();
+        let y = event.position.y.as_f32();
+        let dx = x - self.state.drag_start_x;
+        let dy = y - self.state.drag_start_y;
+        self.state.drag_start_x = x;
+        self.state.drag_start_y = y;
+
+        self.state.pan_x += dx;
+        self.state.pan_y += dy;
+
+        if let Some((base_w, base_h)) = self.preview_dimensions {
+            let (max_x, max_y) = self.pan_limits(base_w as f32, base_h as f32);
+            self.state.pan_x = self.state.pan_x.clamp(-max_x, max_x);
+            self.state.pan_y = self.state.pan_y.clamp(-max_y, max_y);
+        }
+
+        cx.notify();
+    }
+
+    fn end_pan(&mut self, cx: &mut Context<Self>) {
+        if self.state.is_dragging {
+            self.state.is_dragging = false;
+            cx.notify();
+        }
     }
 
     fn accept_ocr(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -258,8 +422,10 @@ impl NumberingMode {
         let entity = cx.entity().clone();
         let (done, total) = self.state.progress();
         let remaining = self.state.remaining();
+        let sticker_name = crate::ocr::sticker_template_name();
+        let has_sticker = crate::ocr::has_sticker_template();
 
-        h_flex()
+        let mut row = h_flex()
             .px_3()
             .py_2()
             .gap_3()
@@ -275,6 +441,17 @@ impl NumberingMode {
                         let entity = entity.clone();
                         move |_, window, cx| {
                             entity.update(cx, |this, cx| this.open_folder(window, cx));
+                        }
+                    }),
+            )
+            .child(
+                Button::new("open-sticker-template")
+                    .label("Sticker Template")
+                    .small()
+                    .on_click({
+                        let entity = entity.clone();
+                        move |_, window, cx| {
+                            entity.update(cx, |this, cx| this.open_sticker_template(window, cx));
                         }
                     }),
             )
@@ -302,26 +479,66 @@ impl NumberingMode {
                 move |_, _, cx| {
                     entity.update(cx, |this, cx| this.undo(cx));
                 }
-            }))
+            }));
+
+        if has_sticker {
+            row = row.child(
+                Button::new("clear-sticker-template")
+                    .label("Clear Sticker")
+                    .small()
+                    .on_click({
+                        let entity = entity.clone();
+                        move |_, _, cx| {
+                            entity.update(cx, |this, cx| this.clear_sticker_template(cx));
+                        }
+                    }),
+            );
+        }
+
+        if let Some(name) = sticker_name {
+            row = row.child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!("Template: {name}")),
+            );
+        }
+
+        row
     }
 
     fn render_image_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity().clone();
 
-        let content = if let Some(ref preview) = self.preview_path {
-            div()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    img(gpui::ImageSource::Resource(gpui::Resource::Path(
-                        preview.clone().into(),
-                    )))
-                    .max_w_full()
-                    .max_h_full()
-                    .object_fit(ObjectFit::Contain),
-                )
+        let content = if let Some(ref preview) = self.preview_image {
+            let source = gpui::ImageSource::Image(preview.clone());
+            let (base_w, base_h) = self.preview_dimensions.unwrap_or((1200, 900));
+            let (fit_w, fit_h) = self.fitted_size(base_w as f32, base_h as f32);
+            let scaled_w = (fit_w * self.state.zoom_level).max(1.0);
+            let scaled_h = (fit_h * self.state.zoom_level).max(1.0);
+            let (max_pan_x, max_pan_y) = self.pan_limits(base_w as f32, base_h as f32);
+            let pan_x = self.state.pan_x.clamp(-max_pan_x, max_pan_x);
+            let pan_y = self.state.pan_y.clamp(-max_pan_y, max_pan_y);
+
+            div().size_full().relative().overflow_hidden().child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        img(source)
+                            .w(px(scaled_w))
+                            .h(px(scaled_h))
+                            .object_fit(ObjectFit::Fill)
+                            .ml(px(pan_x))
+                            .mt(px(pan_y)),
+                    ),
+            )
         } else {
             div()
                 .size_full()
@@ -339,13 +556,51 @@ impl NumberingMode {
         div()
             .id("image-view")
             .flex_1()
-            .size_full()
+            .min_w(px(0.))
+            .min_h(px(0.))
+            .w_full()
             .bg(hsla(0., 0., 0.1, 1.0))
+            .overflow_hidden()
             .on_scroll_wheel({
                 let entity = entity.clone();
-                move |ev, _, cx| {
+                move |ev, window, cx| {
+                    window.prevent_default();
+                    cx.stop_propagation();
                     let delta = ev.delta.pixel_delta(px(1.0)).y.as_f32();
                     entity.update(cx, |this, cx| this.handle_scroll(delta, cx));
+                }
+            })
+            .on_mouse_down(MouseButton::Left, {
+                let entity = entity.clone();
+                move |ev, _, cx| {
+                    entity.update(cx, |this, cx| this.start_pan(ev, cx));
+                }
+            })
+            .on_mouse_move({
+                let entity = entity.clone();
+                move |ev, _, cx| {
+                    entity.update(cx, |this, cx| this.handle_pan_move(ev, cx));
+                }
+            })
+            .on_mouse_up(MouseButton::Left, {
+                let entity = entity.clone();
+                move |_, _, cx| {
+                    entity.update(cx, |this, cx| this.end_pan(cx));
+                }
+            })
+            .on_mouse_up_out(MouseButton::Left, {
+                let entity = entity.clone();
+                move |_, _, cx| {
+                    entity.update(cx, |this, cx| this.end_pan(cx));
+                }
+            })
+            .on_prepaint({
+                let entity = entity.clone();
+                move |bounds, _, cx| {
+                    entity.update(cx, |this, _| {
+                        this.image_view_size =
+                            Some((bounds.size.width.as_f32(), bounds.size.height.as_f32()));
+                    });
                 }
             })
             .child(content)
@@ -353,6 +608,7 @@ impl NumberingMode {
 
     fn render_input_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity().clone();
+        let input_entity = entity.clone();
 
         let ocr_element = if let Some(ref suggestion) = self.state.ocr_suggestion {
             let (color, icon) = match suggestion.confidence_level() {
@@ -388,10 +644,20 @@ impl NumberingMode {
             div()
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
-                .child("🔄 Reading number...")
+                .child("Reading number...")
+                .into_any_element()
+        } else if !crate::ocr::is_ocr_available() {
+            div()
+                .text_sm()
+                .text_color(hsla(0.0, 0.85, 0.6, 1.0))
+                .child("OCR unavailable (missing model files)")
                 .into_any_element()
         } else {
-            div().into_any_element()
+            div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child("OCR: no guess for this image")
+                .into_any_element()
         };
 
         h_flex()
@@ -408,7 +674,20 @@ impl NumberingMode {
                     .font_weight(FontWeight::MEDIUM)
                     .child("Number:"),
             )
-            .child(Input::new(&self.input_state).w(px(200.0)))
+            .child(
+                div()
+                    .capture_key_down({
+                        let input_entity = input_entity.clone();
+                        move |ev, window, cx| {
+                            if ev.keystroke.key.as_str() == "tab" {
+                                window.prevent_default();
+                                cx.stop_propagation();
+                                input_entity.update(cx, |this, cx| this.accept_ocr(window, cx));
+                            }
+                        }
+                    })
+                    .child(Input::new(&self.input_state).w(px(200.0)).tab_index(-1)),
+            )
             .child(
                 Button::new("confirm")
                     .label("Enter ↵")
@@ -447,15 +726,32 @@ impl NumberingMode {
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child("Scroll: zoom | Drag: pan | Tab: accept OCR | Ctrl+Z: undo"),
+                    .child(
+                        "Scroll over image: zoom | Tab in number input: accept OCR | Ctrl+Z: undo",
+                    ),
             )
     }
 }
 
 impl Render for NumberingMode {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity = cx.entity().clone();
+
         v_flex()
             .size_full()
+            .capture_key_down({
+                let entity = entity.clone();
+                move |ev, window, cx| {
+                    let key = ev.keystroke.key.as_str();
+                    let mods = ev.keystroke.modifiers;
+
+                    if (mods.control || mods.platform) && key.eq_ignore_ascii_case("z") {
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        entity.update(cx, |this, cx| this.undo(cx));
+                    }
+                }
+            })
             .child(self.render_toolbar(cx))
             .child(self.render_image_view(cx))
             .child(self.render_input_bar(cx))

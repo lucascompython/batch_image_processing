@@ -53,7 +53,7 @@ pub struct NumberingState {
     /// Zoom level (1.0 = fit to view, >1.0 = zoomed in)
     pub zoom_level: f32,
 
-    /// Pan offset as fraction of image size (-0.5 to 0.5)
+    /// Pan offset in viewport pixels.
     pub pan_x: f32,
     pub pan_y: f32,
 
@@ -133,20 +133,18 @@ impl NumberingState {
 
     /// Zoom in by a factor.
     pub fn zoom_in(&mut self) {
-        self.zoom_level = (self.zoom_level * 1.25).min(10.0);
+        self.zoom_level = (self.zoom_level * 1.20).min(8.0);
     }
 
     /// Zoom out by a factor.
     pub fn zoom_out(&mut self) {
-        self.zoom_level = (self.zoom_level / 1.25).max(0.1);
+        self.zoom_level = (self.zoom_level / 1.20).max(1.0);
     }
 
-    /// Apply pan delta (normalized to image size).
+    /// Apply pan delta in pixels.
     pub fn pan(&mut self, dx: f32, dy: f32) {
-        // Limit pan to keep image partially visible
-        let max_pan = 0.5 * self.zoom_level;
-        self.pan_x = (self.pan_x + dx).clamp(-max_pan, max_pan);
-        self.pan_y = (self.pan_y + dy).clamp(-max_pan, max_pan);
+        self.pan_x += dx;
+        self.pan_y += dy;
     }
 
     /// Process number input and move file.
