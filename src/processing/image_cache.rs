@@ -7,7 +7,8 @@ use image::{DynamicImage, RgbaImage};
 use lru::LruCache;
 use parking_lot::Mutex;
 use rayon::prelude::*;
-use std::hash::{Hash, Hasher};
+use rapidhash::fast::RapidHasher;
+use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,9 +20,6 @@ use super::image_ops::{self, Rotation, TextOverlayConfig};
 pub struct CachedImage {
     /// RGBA pixel data
     pub rgba: Arc<RgbaImage>,
-    /// Original image dimensions (before thumbnail)
-    pub original_width: u32,
-    pub original_height: u32,
 }
 
 /// Cache key combining path and rendering parameters.
@@ -49,9 +47,11 @@ impl CacheKey {
     }
 }
 
+type RapidBuildHasher = BuildHasherDefault<RapidHasher<'static>>;
+
 /// Thread-safe LRU cache for image thumbnails.
 pub struct ImageCache {
-    cache: Mutex<LruCache<CacheKey, CachedImage>>,
+    cache: Mutex<LruCache<CacheKey, CachedImage, RapidBuildHasher>>,
     max_size: u32,
 }
 
@@ -59,8 +59,9 @@ impl ImageCache {
     /// Create a new cache with the given capacity (number of images).
     pub fn new(capacity: usize) -> Self {
         Self {
-            cache: Mutex::new(LruCache::new(
+            cache: Mutex::new(LruCache::with_hasher(
                 NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::new(10).unwrap()),
+                RapidBuildHasher::default(),
             )),
             max_size: 1200,
         }
@@ -83,7 +84,7 @@ impl ImageCache {
             }
         }
 
-        // Decode image
+        // Decode image (outside lock)
         let cached = self.decode_image(path, rotation, text_config)?;
 
         // Store in cache
@@ -104,9 +105,6 @@ impl ImageCache {
     ) -> Option<CachedImage> {
         let mut img = image_ops::load_image(path).ok()?;
 
-        let original_width = img.width();
-        let original_height = img.height();
-
         // Apply rotation
         if rotation != Rotation::None {
             img = image_ops::rotate_image(&img, rotation);
@@ -124,8 +122,6 @@ impl ImageCache {
 
         Some(CachedImage {
             rgba: Arc::new(final_img.into_rgba8()),
-            original_width,
-            original_height,
         })
     }
 
@@ -137,25 +133,27 @@ impl ImageCache {
         rotation: Rotation,
         text_config: Option<&TextOverlayConfig>,
     ) {
-        let paths: Vec<_> = paths.to_vec();
-        let text_config = text_config.cloned();
         let max_size = self.max_size;
 
         // Check which paths need decoding
-        let to_decode: Vec<_> = {
+        let to_decode: Vec<PathBuf> = {
             let cache = self.cache.lock();
             paths
-                .into_iter()
+                .iter()
                 .filter(|p| {
-                    let key = CacheKey::new(p, rotation, max_size, text_config.as_ref());
+                    let key = CacheKey::new(p, rotation, max_size, text_config);
                     !cache.contains(&key)
                 })
+                .cloned()
                 .collect()
         };
 
         if to_decode.is_empty() {
             return;
         }
+
+        // Clone text_config once for parallel use
+        let text_config = text_config.cloned();
 
         // Decode in parallel using rayon
         let results: Vec<_> = to_decode
@@ -173,25 +171,6 @@ impl ImageCache {
             cache.put(key, cached);
         }
     }
-
-    /// Clear the entire cache.
-    pub fn clear(&self) {
-        self.cache.lock().clear();
-    }
-
-    /// Invalidate cache entries for a specific path.
-    pub fn invalidate(&self, path: &Path) {
-        let mut cache = self.cache.lock();
-        // Remove all entries for this path regardless of rotation/text config
-        let keys_to_remove: Vec<_> = cache
-            .iter()
-            .filter(|(k, _)| k.path == path)
-            .map(|(k, _)| k.clone())
-            .collect();
-        for key in keys_to_remove {
-            cache.pop(&key);
-        }
-    }
 }
 
 impl Default for ImageCache {
@@ -205,7 +184,7 @@ fn text_signature(text_config: Option<&TextOverlayConfig>) -> u64 {
         return 0;
     };
 
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = RapidHasher::default();
     cfg.text_template.hash(&mut hasher);
     cfg.position.hash(&mut hasher);
     cfg.font_size.to_bits().hash(&mut hasher);

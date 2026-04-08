@@ -71,7 +71,8 @@ pub struct App {
     // Image list (batch mode)
     image_paths: Vec<PathBuf>,
     selected_index: Option<usize>,
-    preview_path: Option<PathBuf>,
+    /// In-memory preview image (avoids temp file I/O).
+    preview_image: Option<Arc<Image>>,
     preview_version: usize,
 
     // Settings (batch mode)
@@ -291,14 +292,11 @@ impl App {
         subs.push(cx.subscribe_in(
             &text_input,
             window,
-            |this, state, ev: &InputEvent, _window, cx| match ev {
-                InputEvent::Change => {
-                    let val = state.read(cx).value();
-                    this.text_template_value = val.to_string();
-                    this.schedule_preview_update(cx);
-                    cx.notify();
-                }
-                _ => {}
+            |this, state, ev: &InputEvent, _window, cx| if let InputEvent::Change = ev {
+                let val = state.read(cx).value();
+                this.text_template_value = val.to_string();
+                this.schedule_preview_update(cx);
+                cx.notify();
             },
         ));
 
@@ -325,7 +323,7 @@ impl App {
 
             image_paths: Vec::new(),
             selected_index: None,
-            preview_path: None,
+            preview_image: None,
             preview_version: 0,
 
             quality: 70,
@@ -372,7 +370,7 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn open_folder(&mut self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, mut cx| {
+        cx.spawn(async move |this, cx| {
             let handle = rfd::AsyncFileDialog::new()
                 .set_title("Select image folder")
                 .pick_folder()
@@ -398,9 +396,13 @@ impl App {
                 _ = this.update(cx, |this, cx| {
                     this.status_message = format!("Loaded {} images", images.len()).into();
                     this.image_paths = images;
-                    this.selected_index = None;
-                    this.preview_path = None;
+                    this.selected_index = (!this.image_paths.is_empty()).then_some(0);
                     this.batch_results.clear();
+                    if this.selected_index.is_some() {
+                        this.schedule_preview_update(cx);
+                    } else {
+                        this.preview_image = None;
+                    }
                     cx.notify();
                 });
             }
@@ -415,7 +417,7 @@ impl App {
     }
 
     fn choose_output_dir(&mut self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, mut cx| {
+        cx.spawn(async move |this, cx| {
             let handle = rfd::AsyncFileDialog::new()
                 .set_title("Select output folder")
                 .pick_folder()
@@ -465,8 +467,8 @@ impl App {
 
         let executor = cx.background_executor().clone();
 
-        let entity = cx.entity().downgrade();
-        cx.spawn(async move |this, mut cx| {
+        let _entity = cx.entity().downgrade();
+        cx.spawn(async move |this, cx| {
             let results = executor
                 .spawn(async move {
                     crate::processing::batch::process_batch(&paths, &config, |_, _| {})
@@ -507,32 +509,57 @@ impl App {
 
         let cache = self.image_cache.clone();
 
-        cx.spawn(async move |this, mut cx| {
-            // Use cache for base decode/rotation. Apply text overlay from current settings.
-            let result: Option<PathBuf> = (|| {
+        cx.spawn(async move |this, cx| {
+            // Check if still current before doing work
+            let still_current = this
+                .update(cx, |this, _| version == this.preview_version)
+                .unwrap_or(false);
+            if !still_current {
+                return;
+            }
+
+            // Use cache for base decode/rotation. Apply text overlay in-memory.
+            let result: Option<Arc<Image>> = (|| {
                 let cached = cache.get_or_decode(&path, rotation, None)?;
-                let mut preview = image::DynamicImage::ImageRgba8((*cached.rgba).clone());
-                if let Some(cfg) = text_config.as_ref() {
+
+                // Start with cached base image
+                let rgba = if let Some(cfg) = text_config.as_ref() {
+                    let preview = image::DynamicImage::ImageRgba8((*cached.rgba).clone());
                     let filename = path.file_stem().and_then(|n| n.to_str()).unwrap_or("image");
-                    preview = crate::processing::image_ops::overlay_text(preview, cfg, filename);
-                }
-                let temp_path = std::env::temp_dir().join(format!("bip_preview_{version}.png"));
-                preview
-                    .save_with_format(&temp_path, image::ImageFormat::Png)
-                    .ok()?;
-                Some(temp_path)
+                    let overlayed = crate::processing::image_ops::overlay_text(preview, cfg, filename);
+                    overlayed.into_rgba8()
+                } else {
+                    (*cached.rgba).clone()
+                };
+
+                // Encode to PNG in-memory for GPUI Image
+                let mut bytes = Vec::new();
+                let encoder = image::codecs::png::PngEncoder::new_with_quality(
+                    &mut bytes,
+                    image::codecs::png::CompressionType::Fast,
+                    image::codecs::png::FilterType::NoFilter,
+                );
+                image::ImageEncoder::write_image(
+                    encoder,
+                    rgba.as_raw(),
+                    rgba.width(),
+                    rgba.height(),
+                    image::ColorType::Rgba8.into(),
+                )
+                .ok()?;
+                Some(Arc::new(Image::from_bytes(gpui::ImageFormat::Png, bytes)))
             })();
 
             _ = this.update(cx, |this, cx| {
                 if version == this.preview_version {
-                    this.preview_path = result;
+                    this.preview_image = result;
                 }
                 cx.notify();
             });
         })
         .detach();
 
-        // Preload adjacent images in background
+        // Preload adjacent images in background (base only, text applied on fly)
         self.preload_adjacent(cx);
     }
 
@@ -557,6 +584,7 @@ impl App {
         let cache = self.image_cache.clone();
         let rotation = self.rotation;
 
+        // Preload base images (no text overlay - that's applied on the fly)
         cx.background_executor()
             .spawn(async move {
                 cache.preload(&adjacent, rotation, None);
@@ -661,19 +689,17 @@ impl App {
     }
 
     fn render_preview(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let content = if let Some(ref preview) = self.preview_path {
+        let content = if let Some(ref preview) = self.preview_image {
             div()
                 .size_full()
                 .flex()
                 .items_center()
                 .justify_center()
                 .child(
-                    img(gpui::ImageSource::Resource(gpui::Resource::Path(
-                        preview.clone().into(),
-                    )))
-                    .max_w_full()
-                    .max_h_full()
-                    .object_fit(ObjectFit::Contain),
+                    img(gpui::ImageSource::Image(preview.clone()))
+                        .max_w_full()
+                        .max_h_full()
+                        .object_fit(ObjectFit::Contain),
                 )
                 .into_any_element()
         } else {
@@ -694,9 +720,10 @@ impl App {
         div()
             .flex_1()
             .min_w(px(0.))
+            .min_h(px(0.))
             .h_full()
-            .p_1()
             .overflow_hidden()
+            .p_1()
             .child(content)
     }
 
@@ -934,7 +961,8 @@ impl Render for App {
                 let main_row = h_flex()
                     .flex_1()
                     .min_w(px(0.))
-                    .overflow_x_scrollbar()
+                    .min_h(px(0.))
+                    .overflow_hidden()
                     .child(self.render_sidebar(cx))
                     .child(self.render_preview(cx))
                     .child(self.render_settings(cx));

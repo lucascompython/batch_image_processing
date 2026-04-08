@@ -7,7 +7,7 @@ default-run = "batch_image_processing"
 
 [dependencies]
 gpui = { git = "https://github.com/zed-industries/zed" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "x11", "wayland"] }
 gpui-component = { git = "https://github.com/longbridgeapp/gpui-component" }
 gpui-component-assets = { git = "https://github.com/longbridgeapp/gpui-component" }
 image = { version = "0.25", default-features = false, features = ["rayon", "jpeg", "png"] }
@@ -21,6 +21,10 @@ turbojpeg = "1.4"
 mimalloc = { version = "0.1", features = ["v3"] }
 lru = "0.16"
 parking_lot = "0.12"
+
+# High-performance concurrent containers
+scc = "3"
+rapidhash = { version = "4", features = ["unsafe", "nightly", "rng"] }
 
 # OCR (ONNX Runtime backend)
 oar-ocr = "0.6.2"

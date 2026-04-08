@@ -6,13 +6,18 @@ use image::imageops::FilterType;
 use image::{DynamicImage, GrayImage};
 use imageproc::template_matching::{MatchTemplateMethod, find_extremes, match_template_parallel};
 use oar_ocr::oarocr::{OAROCR, OAROCRBuilder};
+use rapidhash::fast::RapidHasher;
+use scc::HashMap as SccHashMap;
 use std::collections::HashMap;
+use std::hash::BuildHasherDefault;
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
-/// Global OCR engine instance (lazy initialized)
 static OCR_ENGINE: OnceLock<Option<OAROCR>> = OnceLock::new();
 static STICKER_TEMPLATE: OnceLock<RwLock<Option<StickerTemplate>>> = OnceLock::new();
+static OCR_CACHE: OnceLock<
+    SccHashMap<PathBuf, OcrResult, BuildHasherDefault<RapidHasher<'static>>>,
+> = OnceLock::new();
 
 const OCR_MAX_SIDE: u32 = 1800;
 const MATCH_MAX_SIDE: u32 = 900;
@@ -24,8 +29,8 @@ const DEFAULT_NUMBER_ROI: NormalizedRect = NormalizedRect {
     w: 0.38,
     h: 0.45,
 };
+const OCR_CACHE_MAX_SIZE: usize = 10;
 
-/// Result of OCR recognition
 #[derive(Debug, Clone)]
 pub struct OcrResult {
     /// Detected text (filtered to digits only for motorcycle numbers)
@@ -91,7 +96,6 @@ struct CandidateStats {
     template_hits: usize,
 }
 
-/// Initialize the OCR engine (call once at startup)
 pub fn init_ocr() -> Result<(), String> {
     OCR_ENGINE.get_or_init(|| {
         let model_dir = model_dir();
@@ -181,6 +185,71 @@ pub fn has_sticker_template() -> bool {
         .read()
         .map(|lock| lock.is_some())
         .unwrap_or(false)
+}
+
+type OcrCacheMap = SccHashMap<PathBuf, OcrResult, BuildHasherDefault<RapidHasher<'static>>>;
+
+fn ocr_cache() -> &'static OcrCacheMap {
+    OCR_CACHE.get_or_init(OcrCacheMap::default)
+}
+
+pub fn get_cached_ocr(path: &Path) -> Option<OcrResult> {
+    ocr_cache().read_sync(path, |_, v| v.clone())
+}
+
+fn cache_ocr_result(path: &Path, result: OcrResult) {
+    let cache = ocr_cache();
+    if cache.len() >= OCR_CACHE_MAX_SIZE {
+        cache.clear_sync();
+    }
+    let _ = cache.insert_sync(path.to_path_buf(), result);
+}
+
+pub fn recognize_number_for_path(path: &Path, img: &DynamicImage) -> Option<OcrResult> {
+    if let Some(cached) = get_cached_ocr(path) {
+        return Some(cached);
+    }
+
+    let result = recognize_number(img)?;
+    cache_ocr_result(path, result.clone());
+    Some(result)
+}
+
+/// Preload OCR results for multiple paths in background.
+///
+/// This loads images and runs OCR, caching results for later use.
+pub fn preload_ocr(paths: &[PathBuf]) {
+    use rayon::prelude::*;
+
+    if !is_ocr_available() {
+        return;
+    }
+
+    let cache = ocr_cache();
+
+    // Filter to paths not already cached
+    let to_process: Vec<_> = paths
+        .iter()
+        .filter(|p| !cache.contains_sync(*p))
+        .cloned()
+        .collect();
+
+    if to_process.is_empty() {
+        return;
+    }
+
+    // Process in parallel and insert directly (scc is lock-free)
+    to_process.par_iter().for_each(|path| {
+        if let Ok(img) = crate::processing::image_ops::load_image(path)
+            && let Some(result) = recognize_number(&img)
+        {
+            // Simple eviction check
+            if cache.len() >= OCR_CACHE_MAX_SIZE {
+                cache.clear_sync();
+            }
+            let _ = cache.insert_sync(path.clone(), result);
+        }
+    });
 }
 
 /// Run OCR on an image and extract likely motorcycle numbers.

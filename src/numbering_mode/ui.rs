@@ -29,15 +29,13 @@ impl NumberingMode {
 
         let mut subs = Vec::new();
 
-        // Subscribe to input changes
         subs.push(cx.subscribe_in(
             &input_state,
             window,
-            |this, _state, ev: &InputEvent, window, cx| match ev {
-                InputEvent::PressEnter { .. } => {
+            |this, _state, ev: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { .. } = ev {
                     this.confirm_and_advance(window, cx);
                 }
-                _ => {}
             },
         ));
 
@@ -55,7 +53,7 @@ impl NumberingMode {
 
     pub fn open_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let entity = cx.entity().clone();
-        cx.spawn_in(window, async move |_this, mut cx| {
+        cx.spawn_in(window, async move |_this, cx| {
             let handle = rfd::AsyncFileDialog::new()
                 .set_title("Select image folder for numbering")
                 .pick_folder()
@@ -78,7 +76,7 @@ impl NumberingMode {
                     .collect();
                 images.sort();
 
-                _ = entity.update(cx, |this, cx| {
+                entity.update(cx, |this, cx| {
                     this.state.source_folder = Some(dir);
                     this.state.image_paths = images;
                     this.state.current_index = 0;
@@ -87,7 +85,7 @@ impl NumberingMode {
                     this.state.status_message =
                         format!("Loaded {} images", this.state.image_paths.len());
 
-                    // Load first image
+                    // load first image
                     this.load_current_image(cx);
                     cx.notify();
                 });
@@ -98,7 +96,7 @@ impl NumberingMode {
 
     fn open_sticker_template(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let entity = cx.entity().clone();
-        cx.spawn_in(window, async move |_this, mut cx| {
+        cx.spawn_in(window, async move |_this, cx| {
             let handle = rfd::AsyncFileDialog::new()
                 .set_title("Select event sticker template")
                 .add_filter("Images", &["png", "jpg", "jpeg"])
@@ -109,7 +107,7 @@ impl NumberingMode {
                 let path = file.path().to_path_buf();
                 let load_result = crate::ocr::set_sticker_template(&path);
 
-                _ = entity.update(cx, |this, cx| {
+                entity.update(cx, |this, cx| {
                     match load_result {
                         Ok(()) => {
                             let label = path
@@ -148,11 +146,10 @@ impl NumberingMode {
             self.state.pan_y = 0.0;
             self.state.is_dragging = false;
 
-            // Mark OCR as running
             self.state.ocr_running = ocr_enabled;
             self.state.ocr_suggestion = None;
 
-            // Load and present preview as soon as possible.
+            // load and present preview as soon as possible.
             cx.spawn(async move |this, cx| {
                 let still_current = this
                     .update(cx, |this, _| version == this.preview_version)
@@ -203,7 +200,7 @@ impl NumberingMode {
             })
             .detach();
 
-            // OCR runs independently so image transitions stay snappy.
+            // OCR runs independently so image transitions stay snappy
             if ocr_enabled {
                 let ocr_path = path.clone();
                 cx.spawn(async move |this, cx| {
@@ -214,9 +211,11 @@ impl NumberingMode {
                         return;
                     }
 
-                    let ocr = crate::processing::image_ops::load_image(&ocr_path)
-                        .ok()
-                        .and_then(|img| crate::ocr::recognize_number(&img));
+                    let ocr = crate::ocr::get_cached_ocr(&ocr_path).or_else(|| {
+                        crate::processing::image_ops::load_image(&ocr_path)
+                            .ok()
+                            .and_then(|img| crate::ocr::recognize_number_for_path(&ocr_path, &img))
+                    });
 
                     _ = this.update(cx, |this, cx| {
                         if version == this.preview_version {
@@ -235,7 +234,7 @@ impl NumberingMode {
                 self.state.ocr_running = false;
             }
 
-            // Preload adjacent images
+            // Preload adjacent images and OCR
             self.preload_adjacent(cx);
         } else {
             self.preview_image = None;
@@ -246,35 +245,55 @@ impl NumberingMode {
     }
 
     fn preload_adjacent(&self, cx: &mut Context<Self>) {
-        let adjacent: Vec<PathBuf> = {
+        let (image_preload, ocr_preload): (Vec<PathBuf>, Vec<PathBuf>) = {
             let idx = self.state.current_index;
             let paths = &self.state.image_paths;
-            let mut adj = Vec::new();
-            for offset in 1..=2 {
-                if idx >= offset {
-                    adj.push(paths[idx - offset].clone());
-                }
+            let mut img_adj = Vec::with_capacity(6);
+            let mut ocr_adj = Vec::with_capacity(2);
+
+            // Preload images 3 ahead and 2 behind
+            for offset in 1..=3 {
                 if idx + offset < paths.len() {
-                    adj.push(paths[idx + offset].clone());
+                    img_adj.push(paths[idx + offset].clone());
                 }
             }
-            adj
+            for offset in 1..=2 {
+                if idx >= offset {
+                    img_adj.push(paths[idx - offset].clone());
+                }
+            }
+
+            // Preload OCR for next 2 images only (OCR is expensive)
+            for offset in 1..=2 {
+                if idx + offset < paths.len() {
+                    ocr_adj.push(paths[idx + offset].clone());
+                }
+            }
+
+            (img_adj, ocr_adj)
         };
 
-        if adjacent.is_empty() {
-            return;
+        if !image_preload.is_empty() {
+            let cache = self.image_cache.clone();
+            cx.background_executor()
+                .spawn(async move {
+                    cache.preload(
+                        &image_preload,
+                        crate::processing::image_ops::Rotation::None,
+                        None,
+                    );
+                })
+                .detach();
         }
 
-        let cache = self.image_cache.clone();
-        cx.background_executor()
-            .spawn(async move {
-                cache.preload(
-                    &adjacent,
-                    crate::processing::image_ops::Rotation::None,
-                    None,
-                );
-            })
-            .detach();
+        // Preload OCR results for next 2 images
+        if crate::ocr::is_ocr_available() && !ocr_preload.is_empty() {
+            cx.background_executor()
+                .spawn(async move {
+                    crate::ocr::preload_ocr(&ocr_preload);
+                })
+                .detach();
+        }
     }
 
     fn confirm_and_advance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -519,25 +538,18 @@ impl NumberingMode {
             let (max_pan_x, max_pan_y) = self.pan_limits(base_w as f32, base_h as f32);
             let pan_x = self.state.pan_x.clamp(-max_pan_x, max_pan_x);
             let pan_y = self.state.pan_y.clamp(-max_pan_y, max_pan_y);
+            let (view_w, view_h) = self.image_view_size.unwrap_or((fit_w, fit_h));
+            let left = ((view_w - scaled_w) * 0.5 + pan_x).round();
+            let top = ((view_h - scaled_h) * 0.5 + pan_y).round();
 
             div().size_full().relative().overflow_hidden().child(
-                div()
+                img(source)
                     .absolute()
-                    .top_0()
-                    .left_0()
-                    .right_0()
-                    .bottom_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        img(source)
-                            .w(px(scaled_w))
-                            .h(px(scaled_h))
-                            .object_fit(ObjectFit::Fill)
-                            .ml(px(pan_x))
-                            .mt(px(pan_y)),
-                    ),
+                    .left(px(left))
+                    .top(px(top))
+                    .w(px(scaled_w))
+                    .h(px(scaled_h))
+                    .object_fit(ObjectFit::Fill),
             )
         } else {
             div()
@@ -608,7 +620,6 @@ impl NumberingMode {
 
     fn render_input_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity().clone();
-        let input_entity = entity.clone();
 
         let ocr_element = if let Some(ref suggestion) = self.state.ocr_suggestion {
             let (color, icon) = match suggestion.confidence_level() {
@@ -631,6 +642,7 @@ impl NumberingMode {
                     Button::new("accept-ocr")
                         .label(format!("{} ({}%)", suggestion.number, confidence_pct))
                         .small()
+                        .tab_index(-1)
                         .on_click({
                             let entity = entity.clone();
                             move |_, window, cx| {
@@ -674,25 +686,13 @@ impl NumberingMode {
                     .font_weight(FontWeight::MEDIUM)
                     .child("Number:"),
             )
-            .child(
-                div()
-                    .capture_key_down({
-                        let input_entity = input_entity.clone();
-                        move |ev, window, cx| {
-                            if ev.keystroke.key.as_str() == "tab" {
-                                window.prevent_default();
-                                cx.stop_propagation();
-                                input_entity.update(cx, |this, cx| this.accept_ocr(window, cx));
-                            }
-                        }
-                    })
-                    .child(Input::new(&self.input_state).w(px(200.0)).tab_index(-1)),
-            )
+            .child(div().child(Input::new(&self.input_state).w(px(200.0)).tab_index(-1)))
             .child(
                 Button::new("confirm")
                     .label("Enter ↵")
                     .small()
                     .primary()
+                    .tab_index(-1)
                     .on_click({
                         let entity = entity.clone();
                         move |_, window, cx| {
@@ -749,6 +749,10 @@ impl Render for NumberingMode {
                         window.prevent_default();
                         cx.stop_propagation();
                         entity.update(cx, |this, cx| this.undo(cx));
+                    } else if key == "tab" {
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        entity.update(cx, |this, cx| this.accept_ocr(window, cx));
                     }
                 }
             })
