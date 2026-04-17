@@ -219,8 +219,6 @@ pub fn recognize_number_for_path(path: &Path, img: &DynamicImage) -> Option<OcrR
 ///
 /// This loads images and runs OCR, caching results for later use.
 pub fn preload_ocr(paths: &[PathBuf]) {
-    use rayon::prelude::*;
-
     if !is_ocr_available() {
         return;
     }
@@ -238,18 +236,17 @@ pub fn preload_ocr(paths: &[PathBuf]) {
         return;
     }
 
-    // Process in parallel and insert directly (scc is lock-free)
-    to_process.par_iter().for_each(|path| {
-        if let Ok(img) = crate::processing::image_ops::load_image(path)
+    // Run sequentially to avoid saturating CPU and hurting interactive navigation latency.
+    for path in to_process {
+        if let Ok(img) = crate::processing::image_ops::load_image(&path)
             && let Some(result) = recognize_number(&img)
         {
-            // Simple eviction check
             if cache.len() >= OCR_CACHE_MAX_SIZE {
                 cache.clear_sync();
             }
-            let _ = cache.insert_sync(path.clone(), result);
+            let _ = cache.insert_sync(path, result);
         }
-    });
+    }
 }
 
 /// Run OCR on an image and extract likely motorcycle numbers.

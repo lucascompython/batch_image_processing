@@ -1,9 +1,9 @@
 [package]
-name = "batch_image_processing"
+name = "numera"
 version = "0.1.0"
 edition = "2024"
 
-default-run = "batch_image_processing"
+default-run = "numera"
 
 [dependencies]
 gpui = { git = "https://github.com/zed-industries/zed" }
@@ -32,14 +32,14 @@ oar-ocr = "0.6.2"
 # benchmark-only dependencies (behind 'bench' feature)
 zune-jpeg = { version = "0.5", optional = true }
 zune-imageprocs = { version = "0.5", optional = true }
-memmap2 = { version = "0.9", optional = true }
+memmap2 = "0.9"
 zune-core = { version = "0.5", optional = true }
 zune-image = { version = "0.5", default-features = false, features = ["simd", "threads", "jpeg"], optional = true }
 jpeg-encoder = { version = "0.7", optional = true }
 
 
 [features]
-bench = ["zune-jpeg", "zune-imageprocs", "memmap2", "zune-core", "zune-image", "jpeg-encoder"]
+bench = ["zune-jpeg", "zune-imageprocs", "zune-core", "zune-image", "jpeg-encoder"]
 
 [[bin]]
 name = "jpeg_bench"

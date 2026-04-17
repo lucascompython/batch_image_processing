@@ -4,6 +4,7 @@
 //! eliminating redundant decoding when navigating through images.
 
 use image::{DynamicImage, RgbaImage};
+use gpui::Image;
 use lru::LruCache;
 use parking_lot::Mutex;
 use rayon::prelude::*;
@@ -20,6 +21,11 @@ use super::image_ops::{self, Rotation, TextOverlayConfig};
 pub struct CachedImage {
     /// RGBA pixel data
     pub rgba: Arc<RgbaImage>,
+    /// GPUI preview image (decoded once, reused for navigation).
+    pub preview_image: Arc<Image>,
+    /// Preview dimensions.
+    pub width: u32,
+    pub height: u32,
 }
 
 /// Cache key combining path and rendering parameters.
@@ -103,16 +109,22 @@ impl ImageCache {
         rotation: Rotation,
         text_config: Option<&TextOverlayConfig>,
     ) -> Option<CachedImage> {
-        let mut img = image_ops::load_image(path).ok()?;
+        let mut img = image_ops::load_image_for_preview(path, self.max_size).ok()?;
 
         // Apply rotation
         if rotation != Rotation::None {
             img = image_ops::rotate_image(&img, rotation);
         }
 
-        // Generate thumbnail
-        let thumb = image_ops::generate_thumbnail(&img, self.max_size);
-        let mut final_img = DynamicImage::ImageRgba8(thumb);
+        let mut rgba = if img.width().max(img.height()) > self.max_size {
+            image_ops::generate_thumbnail(&img, self.max_size)
+        } else {
+            match img {
+                DynamicImage::ImageRgba8(existing) => existing,
+                other => other.to_rgba8(),
+            }
+        };
+        let mut final_img = DynamicImage::ImageRgba8(rgba);
 
         // Apply text overlay if configured
         if let Some(tc) = text_config {
@@ -120,8 +132,17 @@ impl ImageCache {
             final_img = image_ops::overlay_text(final_img, tc, filename);
         }
 
+        rgba = final_img.into_rgba8();
+        let width = rgba.width();
+        let height = rgba.height();
+        let preview_bytes = encode_preview_png(&rgba)?;
+        let preview_image = Arc::new(Image::from_bytes(gpui::ImageFormat::Png, preview_bytes));
+
         Some(CachedImage {
-            rgba: Arc::new(final_img.into_rgba8()),
+            rgba: Arc::new(rgba),
+            preview_image,
+            width,
+            height,
         })
     }
 
@@ -194,4 +215,22 @@ fn text_signature(text_config: Option<&TextOverlayConfig>) -> u64 {
     cfg.color.a.hash(&mut hasher);
     cfg.margin.hash(&mut hasher);
     hasher.finish()
+}
+
+fn encode_preview_png(rgba: &RgbaImage) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let encoder = image::codecs::png::PngEncoder::new_with_quality(
+        &mut bytes,
+        image::codecs::png::CompressionType::Fast,
+        image::codecs::png::FilterType::NoFilter,
+    );
+    image::ImageEncoder::write_image(
+        encoder,
+        rgba.as_raw(),
+        rgba.width(),
+        rgba.height(),
+        image::ColorType::Rgba8.into(),
+    )
+    .ok()?;
+    Some(bytes)
 }

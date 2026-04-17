@@ -70,6 +70,7 @@ pub struct App {
 
     // Image list (batch mode)
     image_paths: Vec<PathBuf>,
+    image_names: Vec<SharedString>,
     selected_index: Option<usize>,
     /// In-memory preview image (avoids temp file I/O).
     preview_image: Option<Arc<Image>>,
@@ -322,6 +323,7 @@ impl App {
             image_cache,
 
             image_paths: Vec::new(),
+            image_names: Vec::new(),
             selected_index: None,
             preview_image: None,
             preview_version: 0,
@@ -392,10 +394,21 @@ impl App {
                     })
                     .collect();
                 images.sort();
+                let image_names: Vec<SharedString> = images
+                    .iter()
+                    .map(|path| {
+                        path.file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("???")
+                            .to_string()
+                            .into()
+                    })
+                    .collect();
 
                 _ = this.update(cx, |this, cx| {
                     this.status_message = format!("Loaded {} images", images.len()).into();
                     this.image_paths = images;
+                    this.image_names = image_names;
                     this.selected_index = (!this.image_paths.is_empty()).then_some(0);
                     this.batch_results.clear();
                     if this.selected_index.is_some() {
@@ -521,16 +534,16 @@ impl App {
             // Use cache for base decode/rotation. Apply text overlay in-memory.
             let result: Option<Arc<Image>> = (|| {
                 let cached = cache.get_or_decode(&path, rotation, None)?;
+                if text_config.is_none() {
+                    return Some(cached.preview_image.clone());
+                }
 
                 // Start with cached base image
-                let rgba = if let Some(cfg) = text_config.as_ref() {
-                    let preview = image::DynamicImage::ImageRgba8((*cached.rgba).clone());
-                    let filename = path.file_stem().and_then(|n| n.to_str()).unwrap_or("image");
-                    let overlayed = crate::processing::image_ops::overlay_text(preview, cfg, filename);
-                    overlayed.into_rgba8()
-                } else {
-                    (*cached.rgba).clone()
-                };
+                let cfg = text_config.as_ref()?;
+                let preview = image::DynamicImage::ImageRgba8((*cached.rgba).clone());
+                let filename = path.file_stem().and_then(|n| n.to_str()).unwrap_or("image");
+                let rgba =
+                    crate::processing::image_ops::overlay_text(preview, cfg, filename).into_rgba8();
 
                 // Encode to PNG in-memory for GPUI Image
                 let mut bytes = Vec::new();
@@ -552,7 +565,18 @@ impl App {
 
             _ = this.update(cx, |this, cx| {
                 if version == this.preview_version {
-                    this.preview_image = result;
+                    if result.is_some() {
+                        this.preview_image = result;
+                    } else {
+                        this.preview_image = None;
+                        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("image");
+                        this.status_message =
+                            format!("Skipping unreadable image: {name}").into();
+                        if this.selected_index == Some(idx) && idx + 1 < this.image_paths.len() {
+                            this.selected_index = Some(idx + 1);
+                            this.schedule_preview_update(cx);
+                        }
+                    }
                 }
                 cx.notify();
             });
@@ -647,13 +671,7 @@ impl App {
             div()
                 .flex_1()
                 .overflow_y_scrollbar()
-                .children(self.image_paths.iter().enumerate().map(|(i, path)| {
-                    let name: SharedString = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("???")
-                        .to_string()
-                        .into();
+                .children(self.image_names.iter().enumerate().map(|(i, name)| {
                     let is_selected = self.selected_index == Some(i);
                     let entity = entity.clone();
 
@@ -672,7 +690,7 @@ impl App {
                         .on_click(move |_, _window, cx| {
                             entity.update(cx, |this, cx| this.select_image(i, cx));
                         })
-                        .child(name)
+                        .child(name.clone())
                 }))
                 .into_any_element()
         };

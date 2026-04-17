@@ -2,8 +2,12 @@ use ab_glyph::{FontRef, PxScale};
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageReader, RgbaImage};
 use imageproc::drawing::{draw_text_mut, text_size};
+use memmap2::MmapOptions;
 use pdf_writer::{Content, Finish, Name, Pdf, Rect, Ref};
+use std::fs::File;
+use std::io::Cursor;
 use std::path::Path;
+use std::sync::OnceLock;
 
 /// Rotation direction (clockwise).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,26 +72,47 @@ impl Default for TextOverlayConfig {
 
 /// The embedded font bytes (Inter Regular).
 const EMBEDDED_FONT: &[u8] = include_bytes!("../assets/Inter-Regular.ttf");
+static TURBO_SCALING_FACTORS: OnceLock<Vec<turbojpeg::ScalingFactor>> = OnceLock::new();
 
 /// Load an image from disk.
 ///
 /// # Errors
 /// Returns an error if the file cannot be read or decoded.
 pub fn load_image(path: &Path) -> Result<DynamicImage, String> {
-    let orientation = read_image_orientation(path);
-    let raw = std::fs::read(path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    let raw = map_image_file(path)?;
+    decode_image_from_bytes(path, &raw, None)
+}
 
-    if let Ok(img) = turbojpeg::decompress(&raw, turbojpeg::PixelFormat::RGBA)
-        && let Some(rgba) = RgbaImage::from_raw(img.width as u32, img.height as u32, img.pixels)
-    {
-        let mut out = DynamicImage::ImageRgba8(rgba);
-        out.apply_orientation(orientation);
-        return Ok(out);
+/// Load an image optimized for preview generation.
+///
+/// For JPEGs, this uses DCT scaling during decode to avoid full-size decode for huge files.
+pub fn load_image_for_preview(path: &Path, max_side: u32) -> Result<DynamicImage, String> {
+    let raw = map_image_file(path)?;
+    decode_image_from_bytes(path, &raw, Some(max_side))
+}
+
+fn map_image_file(path: &Path) -> Result<memmap2::Mmap, String> {
+    let file = File::open(path).map_err(|e| format!("Failed to open {}: {e}", path.display()))?;
+    // SAFETY: We create a read-only map over an immutable file descriptor and keep
+    // the map alive for the full decode scope. No mutation aliases are created.
+    unsafe { MmapOptions::new().map(&file) }
+        .map_err(|e| format!("Failed to map {}: {e}", path.display()))
+}
+
+fn decode_image_from_bytes(
+    path: &Path,
+    raw: &[u8],
+    preview_max_side: Option<u32>,
+) -> Result<DynamicImage, String> {
+    let orientation = read_image_orientation_from_bytes(raw);
+
+    if let Some(mut img) = decode_with_turbojpeg(raw, preview_max_side) {
+        img.apply_orientation(orientation);
+        return Ok(img);
     }
 
-    // fallback to generic `image` crate decoder if it's a PNG or if turbojpeg fails.
-    let mut decoder = ImageReader::open(path)
-        .map_err(|e| format!("Failed to open {}: {e}", path.display()))?
+    // fallback to generic image decoder if turbojpeg fails or format is non-JPEG.
+    let mut decoder = ImageReader::new(Cursor::new(raw))
         .with_guessed_format()
         .map_err(|e| format!("Failed to guess format for {}: {e}", path.display()))?
         .into_decoder()
@@ -100,11 +125,72 @@ pub fn load_image(path: &Path) -> Result<DynamicImage, String> {
     Ok(img)
 }
 
-fn read_image_orientation(path: &Path) -> Orientation {
-    let Ok(reader) = ImageReader::open(path) else {
-        return Orientation::NoTransforms;
-    };
-    let Ok(reader) = reader.with_guessed_format() else {
+fn decode_with_turbojpeg(raw: &[u8], preview_max_side: Option<u32>) -> Option<DynamicImage> {
+    if let Some(max_side) = preview_max_side {
+        let mut decompressor = turbojpeg::Decompressor::new().ok()?;
+        let header = decompressor.read_header(raw).ok()?;
+        let scaling = select_scaling_factor(header, max_side);
+        if scaling != turbojpeg::ScalingFactor::ONE {
+            decompressor.set_scaling_factor(scaling).ok()?;
+            let scaled = header.scaled(scaling);
+            let pixel_count = scaled.width.checked_mul(scaled.height)?;
+            let len = pixel_count.checked_mul(4)?;
+            let mut image = turbojpeg::Image {
+                pixels: vec![0u8; len],
+                width: scaled.width,
+                pitch: scaled.width.checked_mul(4)?,
+                height: scaled.height,
+                format: turbojpeg::PixelFormat::RGBA,
+            };
+            decompressor.decompress(raw, image.as_deref_mut()).ok()?;
+            let rgba = RgbaImage::from_raw(
+                scaled.width as u32,
+                scaled.height as u32,
+                image.pixels,
+            )?;
+            return Some(DynamicImage::ImageRgba8(rgba));
+        }
+    }
+
+    let decoded = turbojpeg::decompress(raw, turbojpeg::PixelFormat::RGBA).ok()?;
+    let rgba = RgbaImage::from_raw(decoded.width as u32, decoded.height as u32, decoded.pixels)?;
+    Some(DynamicImage::ImageRgba8(rgba))
+}
+
+fn select_scaling_factor(header: turbojpeg::DecompressHeader, max_side: u32) -> turbojpeg::ScalingFactor {
+    let max_side = max_side as usize;
+    if header.width <= max_side && header.height <= max_side {
+        return turbojpeg::ScalingFactor::ONE;
+    }
+
+    let factors = TURBO_SCALING_FACTORS
+        .get_or_init(turbojpeg::Decompressor::supported_scaling_factors);
+
+    let mut best: Option<turbojpeg::ScalingFactor> = None;
+    let mut best_area: usize = 0;
+    for &factor in factors {
+        let w = factor.scale(header.width);
+        let h = factor.scale(header.height);
+        if w <= max_side && h <= max_side {
+            let area = w.saturating_mul(h);
+            if area > best_area {
+                best_area = area;
+                best = Some(factor);
+            }
+        }
+    }
+
+    best.unwrap_or_else(|| {
+        factors
+            .iter()
+            .copied()
+            .min_by_key(|factor| factor.scale(header.width).saturating_mul(factor.scale(header.height)))
+            .unwrap_or(turbojpeg::ScalingFactor::ONE)
+    })
+}
+
+fn read_image_orientation_from_bytes(raw: &[u8]) -> Orientation {
+    let Ok(reader) = ImageReader::new(Cursor::new(raw)).with_guessed_format() else {
         return Orientation::NoTransforms;
     };
     let Ok(mut decoder) = reader.into_decoder() else {

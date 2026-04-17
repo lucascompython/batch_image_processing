@@ -25,6 +25,10 @@ fn main() {
         gpui_component::init(cx);
 
         let opts = gpui::WindowOptions {
+            titlebar: Some(gpui::TitlebarOptions {
+                title: Some("Numera".into()),
+                ..Default::default()
+            }),
             ..Default::default()
         };
 

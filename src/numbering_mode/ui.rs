@@ -167,27 +167,8 @@ impl NumberingMode {
 
                     cached
                         .as_ref()
-                        .and_then(|c| {
-                            let mut bytes = Vec::new();
-                            let encoder = image::codecs::png::PngEncoder::new_with_quality(
-                                &mut bytes,
-                                image::codecs::png::CompressionType::Fast,
-                                image::codecs::png::FilterType::NoFilter,
-                            );
-                            image::ImageEncoder::write_image(
-                                encoder,
-                                c.rgba.as_raw(),
-                                c.rgba.width(),
-                                c.rgba.height(),
-                                image::ColorType::Rgba8.into(),
-                            )
-                            .ok()?;
-                            Some((
-                                Arc::new(Image::from_bytes(gpui::ImageFormat::Png, bytes)),
-                                (c.rgba.width(), c.rgba.height()),
-                            ))
-                        })
-                        .map_or((None, None), |(img, dims)| (Some(img), Some(dims)))
+                        .map(|c| (Some(c.preview_image.clone()), Some((c.width, c.height))))
+                        .unwrap_or((None, None))
                 };
 
                 _ = this.update(cx, |this, cx| {
@@ -245,40 +226,69 @@ impl NumberingMode {
     }
 
     fn preload_adjacent(&self, cx: &mut Context<Self>) {
-        let (image_preload, ocr_preload): (Vec<PathBuf>, Vec<PathBuf>) = {
+        let (priority_preload, secondary_preload, ocr_preload): (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) = {
             let idx = self.state.current_index;
             let paths = &self.state.image_paths;
-            let mut img_adj = Vec::with_capacity(6);
-            let mut ocr_adj = Vec::with_capacity(2);
+            let mut priority = Vec::with_capacity(2);
+            let mut secondary = Vec::with_capacity(4);
 
-            // Preload images 3 ahead and 2 behind
-            for offset in 1..=3 {
+            // Keep one previous image hot in cache for instant "Prev".
+            if idx >= 1 {
+                priority.push(paths[idx - 1].clone());
+            }
+
+            // Keep immediate next image hot as well.
+            if idx + 1 < paths.len() {
+                priority.push(paths[idx + 1].clone());
+            }
+
+            // Additional preload budget in the background.
+            for offset in 2..=3 {
                 if idx + offset < paths.len() {
-                    img_adj.push(paths[idx + offset].clone());
+                    secondary.push(paths[idx + offset].clone());
                 }
             }
-            for offset in 1..=2 {
+            for offset in 2..=2 {
                 if idx >= offset {
-                    img_adj.push(paths[idx - offset].clone());
+                    secondary.push(paths[idx - offset].clone());
                 }
             }
 
-            // Preload OCR for next 2 images only (OCR is expensive)
-            for offset in 1..=2 {
+            // OCR preloading: keep lighter when sticker template is active.
+            let ocr_depth = if crate::ocr::has_sticker_template() {
+                1
+            } else {
+                2
+            };
+            let mut ocr_adj = Vec::with_capacity(ocr_depth);
+            for offset in 1..=ocr_depth {
                 if idx + offset < paths.len() {
                     ocr_adj.push(paths[idx + offset].clone());
                 }
             }
 
-            (img_adj, ocr_adj)
+            (priority, secondary, ocr_adj)
         };
 
-        if !image_preload.is_empty() {
+        if !priority_preload.is_empty() {
             let cache = self.image_cache.clone();
             cx.background_executor()
                 .spawn(async move {
                     cache.preload(
-                        &image_preload,
+                        &priority_preload,
+                        crate::processing::image_ops::Rotation::None,
+                        None,
+                    );
+                })
+                .detach();
+        }
+
+        if !secondary_preload.is_empty() {
+            let cache = self.image_cache.clone();
+            cx.background_executor()
+                .spawn(async move {
+                    cache.preload(
+                        &secondary_preload,
                         crate::processing::image_ops::Rotation::None,
                         None,
                     );
