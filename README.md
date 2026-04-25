@@ -1,7 +1,8 @@
 # Numera
 
 An app for batch processing and numbering photos.  
-Based on some features of FastStone Image Viewer.
+Based on some features of FastStone Image Viewer.  
+Created using the following [xtask-template](https://github.com/lucascompython/xtask-template).
 
 ## Features
 
