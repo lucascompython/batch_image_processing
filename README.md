@@ -1,6 +1,6 @@
 # Numera
 
-An app for batch processing and numbering photos.
+An app for batch processing and numbering photos.  
 Based on some features of FastStone Image Viewer.
 
 ## Features
