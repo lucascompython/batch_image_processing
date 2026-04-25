@@ -166,27 +166,33 @@ fn select_scaling_factor(header: turbojpeg::DecompressHeader, max_side: u32) -> 
     let factors = TURBO_SCALING_FACTORS
         .get_or_init(turbojpeg::Decompressor::supported_scaling_factors);
 
-    let mut best: Option<turbojpeg::ScalingFactor> = None;
-    let mut best_area: usize = 0;
+    let mut best_above: Option<(turbojpeg::ScalingFactor, usize)> = None;
+    let mut best_below: Option<(turbojpeg::ScalingFactor, usize)> = None;
     for &factor in factors {
         let w = factor.scale(header.width);
         let h = factor.scale(header.height);
-        if w <= max_side && h <= max_side {
-            let area = w.saturating_mul(h);
-            if area > best_area {
-                best_area = area;
-                best = Some(factor);
+        let scaled_max = w.max(h);
+
+        if scaled_max >= max_side {
+            match best_above {
+                Some((_, current)) if scaled_max >= current => {}
+                _ => best_above = Some((factor, scaled_max)),
+            }
+        } else {
+            match best_below {
+                Some((_, current)) if scaled_max <= current => {}
+                _ => best_below = Some((factor, scaled_max)),
             }
         }
     }
 
-    best.unwrap_or_else(|| {
-        factors
-            .iter()
-            .copied()
-            .min_by_key(|factor| factor.scale(header.width).saturating_mul(factor.scale(header.height)))
-            .unwrap_or(turbojpeg::ScalingFactor::ONE)
-    })
+    if let Some((factor, _)) = best_above {
+        factor
+    } else if let Some((factor, _)) = best_below {
+        factor
+    } else {
+        turbojpeg::ScalingFactor::ONE
+    }
 }
 
 fn read_image_orientation_from_bytes(raw: &[u8]) -> Orientation {

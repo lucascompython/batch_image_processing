@@ -72,8 +72,8 @@ pub struct App {
     image_paths: Vec<PathBuf>,
     image_names: Vec<SharedString>,
     selected_index: Option<usize>,
-    /// In-memory preview image (avoids temp file I/O).
-    preview_image: Option<Arc<Image>>,
+    /// In-memory preview image ready for GPUI rendering.
+    preview_image: Option<Arc<RenderImage>>,
     preview_version: usize,
 
     // Settings (batch mode)
@@ -231,10 +231,9 @@ impl App {
             &quality_slider,
             window,
             |this, _, ev: &SliderEvent, _window, cx| {
-                if let SliderEvent::Change(val) = ev {
-                    this.quality = val.start() as u8;
-                    cx.notify();
-                }
+                let SliderEvent::Change(val) = ev;
+                this.quality = val.start() as u8;
+                cx.notify();
             },
         ));
 
@@ -243,11 +242,10 @@ impl App {
             &font_size_slider,
             window,
             |this, _, ev: &SliderEvent, _window, cx| {
-                if let SliderEvent::Change(val) = ev {
-                    this.text_font_size = val.start();
-                    this.schedule_preview_update(cx);
-                    cx.notify();
-                }
+                let SliderEvent::Change(val) = ev;
+                this.text_font_size = val.start();
+                this.schedule_preview_update(cx);
+                cx.notify();
             },
         ));
 
@@ -293,11 +291,13 @@ impl App {
         subs.push(cx.subscribe_in(
             &text_input,
             window,
-            |this, state, ev: &InputEvent, _window, cx| if let InputEvent::Change = ev {
-                let val = state.read(cx).value();
-                this.text_template_value = val.to_string();
-                this.schedule_preview_update(cx);
-                cx.notify();
+            |this, state, ev: &InputEvent, _window, cx| {
+                if let InputEvent::Change = ev {
+                    let val = state.read(cx).value();
+                    this.text_template_value = val.to_string();
+                    this.schedule_preview_update(cx);
+                    cx.notify();
+                }
             },
         ));
 
@@ -512,7 +512,8 @@ impl App {
         self.preview_version = self.preview_version.wrapping_add(1);
         let version = self.preview_version;
 
-        let path = self.image_paths[idx].clone();
+        let preview_path = self.image_paths[idx].clone();
+        let status_path = preview_path.clone();
         let rotation = self.rotation;
         let text_config = if self.text_enabled {
             Some(self.build_text_config())
@@ -521,6 +522,7 @@ impl App {
         };
 
         let cache = self.image_cache.clone();
+        let executor = cx.background_executor().clone();
 
         cx.spawn(async move |this, cx| {
             // Check if still current before doing work
@@ -531,37 +533,33 @@ impl App {
                 return;
             }
 
-            // Use cache for base decode/rotation. Apply text overlay in-memory.
-            let result: Option<Arc<Image>> = (|| {
-                let cached = cache.get_or_decode(&path, rotation, None)?;
-                if text_config.is_none() {
-                    return Some(cached.preview_image.clone());
-                }
+            // Run decode/resize/overlay work off the UI executor.
+            let result: Option<Arc<RenderImage>> = executor
+                .spawn(async move {
+                    // Use cache for base decode/rotation. Apply text overlay in-memory.
+                    (|| {
+                        let cached = cache.get_or_decode(&preview_path, rotation, None)?;
+                        if text_config.is_none() {
+                            return Some(cached.preview_image.clone());
+                        }
 
-                // Start with cached base image
-                let cfg = text_config.as_ref()?;
-                let preview = image::DynamicImage::ImageRgba8((*cached.rgba).clone());
-                let filename = path.file_stem().and_then(|n| n.to_str()).unwrap_or("image");
-                let rgba =
-                    crate::processing::image_ops::overlay_text(preview, cfg, filename).into_rgba8();
+                        // Start with cached base image
+                        let cfg = text_config.as_ref()?;
+                        let preview = image::DynamicImage::ImageRgba8((*cached.rgba).clone());
+                        let filename = preview_path
+                            .file_stem()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("image");
+                        let rgba =
+                            crate::processing::image_ops::overlay_text(preview, cfg, filename)
+                                .into_rgba8();
 
-                // Encode to PNG in-memory for GPUI Image
-                let mut bytes = Vec::new();
-                let encoder = image::codecs::png::PngEncoder::new_with_quality(
-                    &mut bytes,
-                    image::codecs::png::CompressionType::Fast,
-                    image::codecs::png::FilterType::NoFilter,
-                );
-                image::ImageEncoder::write_image(
-                    encoder,
-                    rgba.as_raw(),
-                    rgba.width(),
-                    rgba.height(),
-                    image::ColorType::Rgba8.into(),
-                )
-                .ok()?;
-                Some(Arc::new(Image::from_bytes(gpui::ImageFormat::Png, bytes)))
-            })();
+                        Some(Arc::new(
+                            crate::processing::image_cache::render_preview_image(&rgba),
+                        ))
+                    })()
+                })
+                .await;
 
             _ = this.update(cx, |this, cx| {
                 if version == this.preview_version {
@@ -569,9 +567,11 @@ impl App {
                         this.preview_image = result;
                     } else {
                         this.preview_image = None;
-                        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("image");
-                        this.status_message =
-                            format!("Skipping unreadable image: {name}").into();
+                        let name = status_path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("image");
+                        this.status_message = format!("Skipping unreadable image: {name}").into();
                         if this.selected_index == Some(idx) && idx + 1 < this.image_paths.len() {
                             this.selected_index = Some(idx + 1);
                             this.schedule_preview_update(cx);
@@ -714,7 +714,7 @@ impl App {
                 .items_center()
                 .justify_center()
                 .child(
-                    img(gpui::ImageSource::Image(preview.clone()))
+                    img(gpui::ImageSource::Render(preview.clone()))
                         .max_w_full()
                         .max_h_full()
                         .object_fit(ObjectFit::Contain),

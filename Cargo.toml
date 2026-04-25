@@ -19,7 +19,7 @@ pdf-writer = "0.14"
 tokio = { version = "1", features = ["fs", "sync", "rt-multi-thread"] }
 turbojpeg = "1.4"
 mimalloc = { version = "0.1", features = ["v3"] }
-lru = "0.16"
+lru = "0.17"
 parking_lot = "0.12"
 
 # High-performance concurrent containers
@@ -27,7 +27,7 @@ scc = "3"
 rapidhash = { version = "4", features = ["unsafe", "nightly", "rng"] }
 
 # OCR (ONNX Runtime backend)
-oar-ocr = "0.6.2"
+oar-ocr = "0.6"
 
 # benchmark-only dependencies (behind 'bench' feature)
 zune-jpeg = { version = "0.5", optional = true }
@@ -40,6 +40,13 @@ jpeg-encoder = { version = "0.7", optional = true }
 
 [features]
 bench = ["zune-jpeg", "zune-imageprocs", "zune-core", "zune-image", "jpeg-encoder"]
+# Optional OCR GPU/accelerator providers (enable when building on supported machines)
+ocr-cuda = ["oar-ocr/cuda"]
+ocr-tensorrt = ["oar-ocr/tensorrt"]
+ocr-directml = ["oar-ocr/directml"]
+ocr-coreml = ["oar-ocr/coreml"]
+ocr-openvino = ["oar-ocr/openvino"]
+ocr-webgpu = ["oar-ocr/webgpu"]
 
 [[bin]]
 name = "jpeg_bench"

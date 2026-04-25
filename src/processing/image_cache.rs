@@ -3,12 +3,12 @@
 //! This module provides a thread-safe cache for decoded image thumbnails,
 //! eliminating redundant decoding when navigating through images.
 
-use image::{DynamicImage, RgbaImage};
-use gpui::Image;
+use gpui::RenderImage;
+use image::{DynamicImage, Frame, RgbaImage};
 use lru::LruCache;
 use parking_lot::Mutex;
-use rayon::prelude::*;
 use rapidhash::fast::RapidHasher;
+use rayon::prelude::*;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -21,8 +21,8 @@ use super::image_ops::{self, Rotation, TextOverlayConfig};
 pub struct CachedImage {
     /// RGBA pixel data
     pub rgba: Arc<RgbaImage>,
-    /// GPUI preview image (decoded once, reused for navigation).
-    pub preview_image: Arc<Image>,
+    /// GPUI render image ready for direct texture upload/reuse during navigation.
+    pub preview_image: Arc<RenderImage>,
     /// Preview dimensions.
     pub width: u32,
     pub height: u32,
@@ -55,6 +55,19 @@ impl CacheKey {
 
 type RapidBuildHasher = BuildHasherDefault<RapidHasher<'static>>;
 
+const DEFAULT_PREVIEW_MAX_SIDE: u32 = 2400;
+const MIN_PREVIEW_MAX_SIDE: u32 = 512;
+const MAX_PREVIEW_MAX_SIDE: u32 = 8192;
+
+fn preview_max_side_from_env() -> u32 {
+    std::env::var("BIP_PREVIEW_MAX_SIDE")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|&value| value > 0)
+        .map(|value| value.clamp(MIN_PREVIEW_MAX_SIDE, MAX_PREVIEW_MAX_SIDE))
+        .unwrap_or(DEFAULT_PREVIEW_MAX_SIDE)
+}
+
 /// Thread-safe LRU cache for image thumbnails.
 pub struct ImageCache {
     cache: Mutex<LruCache<CacheKey, CachedImage, RapidBuildHasher>>,
@@ -69,7 +82,7 @@ impl ImageCache {
                 NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::new(10).unwrap()),
                 RapidBuildHasher::default(),
             )),
-            max_size: 1200,
+            max_size: preview_max_side_from_env(),
         }
     }
 
@@ -135,8 +148,7 @@ impl ImageCache {
         rgba = final_img.into_rgba8();
         let width = rgba.width();
         let height = rgba.height();
-        let preview_bytes = encode_preview_png(&rgba)?;
-        let preview_image = Arc::new(Image::from_bytes(gpui::ImageFormat::Png, preview_bytes));
+        let preview_image = Arc::new(render_preview_image(&rgba));
 
         Some(CachedImage {
             rgba: Arc::new(rgba),
@@ -217,20 +229,15 @@ fn text_signature(text_config: Option<&TextOverlayConfig>) -> u64 {
     hasher.finish()
 }
 
-fn encode_preview_png(rgba: &RgbaImage) -> Option<Vec<u8>> {
-    let mut bytes = Vec::new();
-    let encoder = image::codecs::png::PngEncoder::new_with_quality(
-        &mut bytes,
-        image::codecs::png::CompressionType::Fast,
-        image::codecs::png::FilterType::NoFilter,
-    );
-    image::ImageEncoder::write_image(
-        encoder,
-        rgba.as_raw(),
-        rgba.width(),
-        rgba.height(),
-        image::ColorType::Rgba8.into(),
-    )
-    .ok()?;
-    Some(bytes)
+pub(crate) fn render_preview_image(rgba: &RgbaImage) -> RenderImage {
+    let mut bgra = rgba.clone();
+
+    // GPUI RenderImage expects BGRA pixels. Keep CachedImage::rgba in RGBA for
+    // callers that still need normal image processing, and convert only the
+    // render copy to avoid PNG encode + GPUI decode on every cached preview.
+    for pixel in bgra.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+
+    RenderImage::new(vec![Frame::new(bgra)])
 }

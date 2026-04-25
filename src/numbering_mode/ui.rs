@@ -15,10 +15,11 @@ pub struct NumberingMode {
     state: NumberingState,
     input_state: Entity<InputState>,
     image_cache: Arc<ImageCache>,
-    preview_image: Option<Arc<Image>>,
+    preview_image: Option<Arc<RenderImage>>,
     preview_dimensions: Option<(u32, u32)>,
     image_view_size: Option<(f32, f32)>,
     preview_version: usize,
+    ocr_sweep_generation: Arc<std::sync::atomic::AtomicUsize>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -47,6 +48,7 @@ impl NumberingMode {
             preview_dimensions: None,
             image_view_size: None,
             preview_version: 0,
+            ocr_sweep_generation: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             _subscriptions: subs,
         }
     }
@@ -85,8 +87,9 @@ impl NumberingMode {
                     this.state.status_message =
                         format!("Loaded {} images", this.state.image_paths.len());
 
-                    // load first image
+                    // load first image immediately, then OCR the folder in reverse order
                     this.load_current_image(cx);
+                    this.start_reverse_ocr_sweep(cx);
                     cx.notify();
                 });
             }
@@ -140,7 +143,9 @@ impl NumberingMode {
             self.preview_version = self.preview_version.wrapping_add(1);
             let version = self.preview_version;
             let cache = self.image_cache.clone();
-            let ocr_enabled = crate::ocr::is_ocr_available();
+            let preview_executor = cx.background_executor().clone();
+            let ocr_executor = preview_executor.clone();
+            let ocr_enabled = crate::ocr::is_ocr_available() || !crate::ocr::is_ocr_initialized();
             let preview_path = path.clone();
             self.state.pan_x = 0.0;
             self.state.pan_y = 0.0;
@@ -149,7 +154,7 @@ impl NumberingMode {
             self.state.ocr_running = ocr_enabled;
             self.state.ocr_suggestion = None;
 
-            // load and present preview as soon as possible.
+            // Load and present preview as soon as possible, but keep decode/resize work off the UI executor.
             cx.spawn(async move |this, cx| {
                 let still_current = this
                     .update(cx, |this, _| version == this.preview_version)
@@ -158,18 +163,20 @@ impl NumberingMode {
                     return;
                 }
 
-                let (preview, dimensions) = {
-                    let cached = cache.get_or_decode(
-                        &preview_path,
-                        crate::processing::image_ops::Rotation::None,
-                        None,
-                    );
+                let (preview, dimensions) = preview_executor
+                    .spawn(async move {
+                        let cached = cache.get_or_decode(
+                            &preview_path,
+                            crate::processing::image_ops::Rotation::None,
+                            None,
+                        );
 
-                    cached
-                        .as_ref()
-                        .map(|c| (Some(c.preview_image.clone()), Some((c.width, c.height))))
-                        .unwrap_or((None, None))
-                };
+                        cached
+                            .as_ref()
+                            .map(|c| (Some(c.preview_image.clone()), Some((c.width, c.height))))
+                            .unwrap_or((None, None))
+                    })
+                    .await;
 
                 _ = this.update(cx, |this, cx| {
                     if version == this.preview_version {
@@ -181,7 +188,8 @@ impl NumberingMode {
             })
             .detach();
 
-            // OCR runs independently so image transitions stay snappy
+            // OCR runs independently so image transitions stay snappy.
+            // Image decode + ONNX inference happen on the background executor, not the UI executor.
             if ocr_enabled {
                 let ocr_path = path.clone();
                 cx.spawn(async move |this, cx| {
@@ -192,11 +200,15 @@ impl NumberingMode {
                         return;
                     }
 
-                    let ocr = crate::ocr::get_cached_ocr(&ocr_path).or_else(|| {
-                        crate::processing::image_ops::load_image(&ocr_path)
-                            .ok()
-                            .and_then(|img| crate::ocr::recognize_number_for_path(&ocr_path, &img))
-                    });
+                    let ocr = ocr_executor
+                        .spawn(async move {
+                            if !crate::ocr::is_ocr_available() && crate::ocr::init_ocr().is_err() {
+                                return None;
+                            }
+
+                            crate::ocr::recognize_number_from_path(&ocr_path)
+                        })
+                        .await;
 
                     _ = this.update(cx, |this, cx| {
                         if version == this.preview_version {
@@ -225,8 +237,39 @@ impl NumberingMode {
         }
     }
 
+    fn start_reverse_ocr_sweep(&mut self, cx: &mut Context<Self>) {
+        if self.state.image_paths.is_empty() {
+            return;
+        }
+
+        let paths: Vec<PathBuf> = self.state.image_paths.iter().rev().cloned().collect();
+        let generation = self
+            .ocr_sweep_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .wrapping_add(1);
+        let cancel_generation = self.ocr_sweep_generation.clone();
+
+        cx.background_executor()
+            .spawn(async move {
+                if !crate::ocr::is_ocr_available() && crate::ocr::init_ocr().is_err() {
+                    return;
+                }
+
+                for path in paths {
+                    if cancel_generation.load(std::sync::atomic::Ordering::Relaxed) != generation {
+                        break;
+                    }
+
+                    if crate::ocr::get_cached_ocr(&path).is_none() {
+                        let _ = crate::ocr::recognize_number_from_path(&path);
+                    }
+                }
+            })
+            .detach();
+    }
+
     fn preload_adjacent(&self, cx: &mut Context<Self>) {
-        let (priority_preload, secondary_preload, ocr_preload): (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) = {
+        let (priority_preload, secondary_preload): (Vec<PathBuf>, Vec<PathBuf>) = {
             let idx = self.state.current_index;
             let paths = &self.state.image_paths;
             let mut priority = Vec::with_capacity(2);
@@ -254,20 +297,7 @@ impl NumberingMode {
                 }
             }
 
-            // OCR preloading: keep lighter when sticker template is active.
-            let ocr_depth = if crate::ocr::has_sticker_template() {
-                1
-            } else {
-                2
-            };
-            let mut ocr_adj = Vec::with_capacity(ocr_depth);
-            for offset in 1..=ocr_depth {
-                if idx + offset < paths.len() {
-                    ocr_adj.push(paths[idx + offset].clone());
-                }
-            }
-
-            (priority, secondary, ocr_adj)
+            (priority, secondary)
         };
 
         if !priority_preload.is_empty() {
@@ -296,14 +326,7 @@ impl NumberingMode {
                 .detach();
         }
 
-        // Preload OCR results for next 2 images
-        if crate::ocr::is_ocr_available() && !ocr_preload.is_empty() {
-            cx.background_executor()
-                .spawn(async move {
-                    crate::ocr::preload_ocr(&ocr_preload);
-                })
-                .detach();
-        }
+        // OCR work is handled by the current-image OCR task plus the reverse-order folder sweep.
     }
 
     fn confirm_and_advance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -540,7 +563,7 @@ impl NumberingMode {
         let entity = cx.entity().clone();
 
         let content = if let Some(ref preview) = self.preview_image {
-            let source = gpui::ImageSource::Image(preview.clone());
+            let source = gpui::ImageSource::Render(preview.clone());
             let (base_w, base_h) = self.preview_dimensions.unwrap_or((1200, 900));
             let (fit_w, fit_h) = self.fitted_size(base_w as f32, base_h as f32);
             let scaled_w = (fit_w * self.state.zoom_level).max(1.0);
@@ -667,6 +690,12 @@ impl NumberingMode {
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
                 .child("Reading number...")
+                .into_any_element()
+        } else if !crate::ocr::is_ocr_initialized() {
+            div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child("OCR initializing...")
                 .into_any_element()
         } else if !crate::ocr::is_ocr_available() {
             div()

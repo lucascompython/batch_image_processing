@@ -5,6 +5,7 @@
 use image::imageops::FilterType;
 use image::{DynamicImage, GrayImage};
 use imageproc::template_matching::{MatchTemplateMethod, find_extremes, match_template_parallel};
+use oar_ocr::core::config::{OrtExecutionProvider, OrtGraphOptimizationLevel, OrtSessionConfig};
 use oar_ocr::oarocr::{OAROCR, OAROCRBuilder};
 use rapidhash::fast::RapidHasher;
 use scc::HashMap as SccHashMap;
@@ -29,7 +30,7 @@ const DEFAULT_NUMBER_ROI: NormalizedRect = NormalizedRect {
     w: 0.38,
     h: 0.45,
 };
-const OCR_CACHE_MAX_SIZE: usize = 10;
+const OCR_CACHE_MAX_SIZE: usize = 16_384;
 
 #[derive(Debug, Clone)]
 pub struct OcrResult {
@@ -107,27 +108,46 @@ pub fn init_ocr() -> Result<(), String> {
             }
         };
 
-        let mut builder = OAROCRBuilder::new(&paths.det_model, &paths.rec_model, &paths.dictionary);
+        let preferred = ocr_ort_config_from_env();
+        let preferred_provider_label = preferred
+            .as_ref()
+            .and_then(ort_provider_label)
+            .unwrap_or("cpu");
 
-        if let Some(model) = paths.doc_ori_model.as_ref() {
-            builder = builder.with_document_image_orientation_classification(model);
-        } else {
-            eprintln!("OCR: doc orientation model not found, continuing without it");
-        }
-
-        if let Some(model) = paths.text_line_ori_model.as_ref() {
-            builder = builder.with_text_line_orientation_classification(model);
-        } else {
-            eprintln!("OCR: text-line orientation model not found, continuing without it");
-        }
-
-        match builder.build() {
+        match build_ocr_engine(&paths, preferred) {
             Ok(engine) => {
-                eprintln!("OCR initialized from {}", model_dir.display());
+                eprintln!(
+                    "OCR initialized from {} (provider: {})",
+                    model_dir.display(),
+                    preferred_provider_label
+                );
                 Some(engine)
             }
-            Err(e) => {
-                eprintln!("Failed to initialize OCR engine: {e}");
+            Err(err) => {
+                if !preferred_provider_label.eq_ignore_ascii_case("cpu") {
+                    eprintln!(
+                        "OCR provider '{}' failed: {}. Falling back to CPU.",
+                        preferred_provider_label, err
+                    );
+                    match build_ocr_engine(&paths, Some(cpu_ort_config())) {
+                        Ok(engine) => {
+                            eprintln!(
+                                "OCR initialized from {} (provider: cpu fallback)",
+                                model_dir.display()
+                            );
+                            return Some(engine);
+                        }
+                        Err(fallback_err) => {
+                            eprintln!(
+                                "Failed to initialize OCR engine (fallback): {}",
+                                fallback_err
+                            );
+                            return None;
+                        }
+                    }
+                }
+
+                eprintln!("Failed to initialize OCR engine: {}", err);
                 None
             }
         }
@@ -138,6 +158,167 @@ pub fn init_ocr() -> Result<(), String> {
     } else {
         Err("OCR engine initialization failed".into())
     }
+}
+
+fn build_ocr_engine(
+    paths: &ModelPaths,
+    ort_config: Option<OrtSessionConfig>,
+) -> Result<OAROCR, String> {
+    let mut builder = OAROCRBuilder::new(&paths.det_model, &paths.rec_model, &paths.dictionary)
+        .image_batch_size(1)
+        .region_batch_size(16);
+
+    if let Some(config) = ort_config {
+        builder = builder.ort_session(config);
+    }
+
+    if let Some(model) = paths.doc_ori_model.as_ref() {
+        builder = builder.with_document_image_orientation_classification(model);
+    } else {
+        eprintln!("OCR: doc orientation model not found, continuing without it");
+    }
+
+    if let Some(model) = paths.text_line_ori_model.as_ref() {
+        builder = builder.with_text_line_orientation_classification(model);
+    } else {
+        eprintln!("OCR: text-line orientation model not found, continuing without it");
+    }
+
+    builder
+        .build()
+        .map_err(|e| format!("failed to build OCR runtime: {e}"))
+}
+
+fn ocr_intra_threads() -> usize {
+    std::env::var("BIP_OCR_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or_else(default_ocr_intra_threads)
+}
+
+fn default_ocr_intra_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 8)
+}
+
+fn cpu_ort_config() -> OrtSessionConfig {
+    let threads = ocr_intra_threads();
+
+    OrtSessionConfig::new()
+        .with_optimization_level(OrtGraphOptimizationLevel::All)
+        .with_intra_threads(threads)
+        .with_inter_threads(1)
+        .with_parallel_execution(true)
+        .with_memory_pattern(true)
+        .with_execution_providers(vec![OrtExecutionProvider::CPU])
+}
+
+fn ocr_ort_config_from_env() -> Option<OrtSessionConfig> {
+    let device = std::env::var("BIP_OCR_DEVICE")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "cpu".to_string());
+
+    let threads = ocr_intra_threads();
+
+    let mut cfg = OrtSessionConfig::new()
+        .with_optimization_level(OrtGraphOptimizationLevel::All)
+        .with_intra_threads(threads)
+        .with_inter_threads(1)
+        .with_parallel_execution(true)
+        .with_memory_pattern(true);
+
+    let providers = parse_execution_providers(&device)?;
+    cfg = cfg.with_execution_providers(providers);
+    Some(cfg)
+}
+
+fn parse_execution_providers(device: &str) -> Option<Vec<OrtExecutionProvider>> {
+    let mut provider_split = device.split(':');
+    let provider = provider_split.next()?.trim();
+    let arg = provider_split.next().map(str::trim);
+
+    let providers = match provider {
+        "cpu" => vec![OrtExecutionProvider::CPU],
+        "cuda" | "gpu" => {
+            let device_id = arg.and_then(|id| id.parse::<i32>().ok()).or(Some(0));
+            vec![
+                OrtExecutionProvider::CUDA {
+                    device_id,
+                    gpu_mem_limit: None,
+                    arena_extend_strategy: None,
+                    cudnn_conv_algo_search: None,
+                    cudnn_conv_use_max_workspace: None,
+                },
+                OrtExecutionProvider::CPU,
+            ]
+        }
+        "directml" | "dml" => {
+            let device_id = arg.and_then(|id| id.parse::<i32>().ok()).or(Some(0));
+            vec![
+                OrtExecutionProvider::DirectML { device_id },
+                OrtExecutionProvider::CPU,
+            ]
+        }
+        "openvino" => vec![
+            OrtExecutionProvider::OpenVINO {
+                device_type: arg.map(|s| s.to_string()),
+                num_threads: None,
+            },
+            OrtExecutionProvider::CPU,
+        ],
+        "tensorrt" | "trt" => {
+            let device_id = arg.and_then(|id| id.parse::<i32>().ok()).or(Some(0));
+            vec![
+                OrtExecutionProvider::TensorRT {
+                    device_id,
+                    max_workspace_size: None,
+                    min_subgraph_size: None,
+                    fp16_enable: Some(true),
+                    timing_cache: Some(true),
+                    timing_cache_path: None,
+                    force_timing_cache: None,
+                    engine_cache: Some(true),
+                    engine_cache_path: None,
+                    dump_ep_context_model: None,
+                    ep_context_file_path: None,
+                },
+                OrtExecutionProvider::CPU,
+            ]
+        }
+        "coreml" => vec![
+            OrtExecutionProvider::CoreML {
+                ane_only: None,
+                subgraphs: Some(true),
+            },
+            OrtExecutionProvider::CPU,
+        ],
+        "webgpu" => vec![OrtExecutionProvider::WebGPU, OrtExecutionProvider::CPU],
+        other => {
+            eprintln!("OCR: unknown BIP_OCR_DEVICE '{}' - using CPU", other);
+            vec![OrtExecutionProvider::CPU]
+        }
+    };
+
+    Some(providers)
+}
+
+fn ort_provider_label(config: &OrtSessionConfig) -> Option<&'static str> {
+    let first = config.get_execution_providers().into_iter().next()?;
+    let label = match first {
+        OrtExecutionProvider::CPU => "cpu",
+        OrtExecutionProvider::CUDA { .. } => "cuda",
+        OrtExecutionProvider::DirectML { .. } => "directml",
+        OrtExecutionProvider::OpenVINO { .. } => "openvino",
+        OrtExecutionProvider::TensorRT { .. } => "tensorrt",
+        OrtExecutionProvider::CoreML { .. } => "coreml",
+        OrtExecutionProvider::WebGPU => "webgpu",
+    };
+    Some(label)
 }
 
 /// Set a sticker template image to bias OCR toward the current event sticker.
@@ -205,48 +386,15 @@ fn cache_ocr_result(path: &Path, result: OcrResult) {
     let _ = cache.insert_sync(path.to_path_buf(), result);
 }
 
-pub fn recognize_number_for_path(path: &Path, img: &DynamicImage) -> Option<OcrResult> {
+pub fn recognize_number_from_path(path: &Path) -> Option<OcrResult> {
     if let Some(cached) = get_cached_ocr(path) {
         return Some(cached);
     }
 
-    let result = recognize_number(img)?;
+    let img = crate::processing::image_ops::load_image_for_preview(path, OCR_MAX_SIDE).ok()?;
+    let result = recognize_number(&img)?;
     cache_ocr_result(path, result.clone());
     Some(result)
-}
-
-/// Preload OCR results for multiple paths in background.
-///
-/// This loads images and runs OCR, caching results for later use.
-pub fn preload_ocr(paths: &[PathBuf]) {
-    if !is_ocr_available() {
-        return;
-    }
-
-    let cache = ocr_cache();
-
-    // Filter to paths not already cached
-    let to_process: Vec<_> = paths
-        .iter()
-        .filter(|p| !cache.contains_sync(*p))
-        .cloned()
-        .collect();
-
-    if to_process.is_empty() {
-        return;
-    }
-
-    // Run sequentially to avoid saturating CPU and hurting interactive navigation latency.
-    for path in to_process {
-        if let Ok(img) = crate::processing::image_ops::load_image(&path)
-            && let Some(result) = recognize_number(&img)
-        {
-            if cache.len() >= OCR_CACHE_MAX_SIZE {
-                cache.clear_sync();
-            }
-            let _ = cache.insert_sync(path, result);
-        }
-    }
 }
 
 /// Run OCR on an image and extract likely motorcycle numbers.
@@ -368,6 +516,11 @@ fn candidate_score(len: usize, confidence: f32, count: usize, template_hits: usi
     let repeat_bonus = ((count.saturating_sub(1)) as f32 * 0.03).min(0.12);
     let template_bonus = ((template_hits as f32) * 0.10).min(0.35);
     confidence + len_bonus + repeat_bonus + template_bonus
+}
+
+/// Check if OCR initialization has completed, whether successfully or unsuccessfully.
+pub fn is_ocr_initialized() -> bool {
+    OCR_ENGINE.get().is_some()
 }
 
 /// Check if OCR is available
