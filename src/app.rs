@@ -12,15 +12,16 @@ use gpui_component::slider::{Slider, SliderEvent, SliderState};
 use gpui_component::{ActiveTheme, Disableable, Sizable, h_flex, v_flex};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use crate::numbering_mode::NumberingMode;
 use crate::processing::batch::{BatchConfig, OutputFormat, ProcessResult};
 use crate::processing::image_cache::ImageCache;
 use crate::processing::image_ops::{Rotation, TextColor, TextOverlayConfig, TextPosition};
-
-// ---------------------------------------------------------------------------
-// SelectItem wrapper
-// ---------------------------------------------------------------------------
+use crate::processing::sort::{
+    NumberedSortConfig, NumberedSortMode, NumberedSortResult, NumberedSortSummary,
+};
 
 #[derive(Clone, Debug)]
 struct SelectOption<V: Clone> {
@@ -38,27 +39,16 @@ impl<V: Clone + 'static> SelectItem for SelectOption<V> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Type aliases
-// ---------------------------------------------------------------------------
-
 type FormatSelectState = SelectState<Vec<SelectOption<OutputFormat>>>;
 type RotationSelectState = SelectState<Vec<SelectOption<Rotation>>>;
 type PositionSelectState = SelectState<Vec<SelectOption<TextPosition>>>;
-
-// ---------------------------------------------------------------------------
-// App Mode
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AppMode {
     BatchProcessing,
     Numbering,
+    Sorting,
 }
-
-// ---------------------------------------------------------------------------
-// App
-// ---------------------------------------------------------------------------
 
 pub struct App {
     // Current mode
@@ -96,6 +86,15 @@ pub struct App {
     status_message: SharedString,
     batch_results: Vec<ProcessResult>,
 
+    // Sorting state
+    sorting_source_dir: Option<PathBuf>,
+    sorting_copy_files: bool,
+    is_sorting: bool,
+    sorting_progress: f32,
+    sorting_status_message: SharedString,
+    sorting_results: Vec<NumberedSortResult>,
+    sorting_summary: Option<NumberedSortSummary>,
+
     // Entity handles
     quality_slider: Entity<SliderState>,
     font_size_slider: Entity<SliderState>,
@@ -111,16 +110,13 @@ pub struct App {
 
 impl App {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        // Shared image cache
         let image_cache = Arc::new(ImageCache::new(15));
 
-        // Numbering mode entity
         let numbering_mode = {
             let cache = image_cache.clone();
             cx.new(|cx| NumberingMode::new(window, cx, cache))
         };
 
-        // Quality slider: 1..100, default 70
         let quality_slider = cx.new(|_| {
             SliderState::new()
                 .min(1.0)
@@ -129,7 +125,6 @@ impl App {
                 .default_value(70.0)
         });
 
-        // Font size slider: 8..200, default 24
         let font_size_slider = cx.new(|_| {
             SliderState::new()
                 .min(8.0)
@@ -138,7 +133,6 @@ impl App {
                 .default_value(24.0)
         });
 
-        // Format select
         let format_items = vec![
             SelectOption {
                 label: "JPEG".into(),
@@ -153,7 +147,6 @@ impl App {
             SelectState::new(format_items, Some(IndexPath::default().row(0)), window, cx)
         });
 
-        // Rotation select
         let rotation_items = vec![
             SelectOption {
                 label: "None".into(),
@@ -181,7 +174,6 @@ impl App {
             )
         });
 
-        // Position select
         let position_items = vec![
             SelectOption {
                 label: "Top Left".into(),
@@ -213,20 +205,16 @@ impl App {
             )
         });
 
-        // Text input
         let text_input = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. {filename}"));
         text_input.update(cx, |state, cx| {
             state.set_value("{filename}", window, cx);
         });
 
-        // Color picker - default white
         let color_picker =
             cx.new(|cx| ColorPickerState::new(window, cx).default_value(hsla(0.0, 0.0, 1.0, 1.0)));
 
-        // ---- Subscriptions ----
         let mut subs = Vec::new();
 
-        // Quality slider
         subs.push(cx.subscribe_in(
             &quality_slider,
             window,
@@ -237,7 +225,6 @@ impl App {
             },
         ));
 
-        // Font size slider
         subs.push(cx.subscribe_in(
             &font_size_slider,
             window,
@@ -249,7 +236,6 @@ impl App {
             },
         ));
 
-        // Format select
         subs.push(cx.subscribe_in(
             &format_select,
             window,
@@ -261,7 +247,6 @@ impl App {
             },
         ));
 
-        // Rotation select
         subs.push(cx.subscribe_in(
             &rotation_select,
             window,
@@ -274,7 +259,6 @@ impl App {
             },
         ));
 
-        // Position select
         subs.push(cx.subscribe_in(
             &position_select,
             window,
@@ -287,7 +271,6 @@ impl App {
             },
         ));
 
-        // Text input
         subs.push(cx.subscribe_in(
             &text_input,
             window,
@@ -301,7 +284,6 @@ impl App {
             },
         ));
 
-        // Color picker
         subs.push(cx.subscribe_in(
             &color_picker,
             window,
@@ -330,7 +312,7 @@ impl App {
 
             quality: 70,
             rotation: Rotation::None,
-            output_format: OutputFormat::Jpeg,
+            output_format: OutputFormat::Pdf,
             output_dir: None,
 
             text_enabled: false,
@@ -345,6 +327,14 @@ impl App {
             status_message: "Ready - Open a folder to begin".into(),
             batch_results: Vec::new(),
 
+            sorting_source_dir: None,
+            sorting_copy_files: false,
+            is_sorting: false,
+            sorting_progress: 0.0,
+            sorting_status_message: "Select a folder of numbered files to sort".into(),
+            sorting_results: Vec::new(),
+            sorting_summary: None,
+
             quality_slider,
             font_size_slider,
             format_select,
@@ -358,18 +348,10 @@ impl App {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Mode switching
-    // -----------------------------------------------------------------------
-
     fn set_mode(&mut self, mode: AppMode, cx: &mut Context<Self>) {
         self.mode = mode;
         cx.notify();
     }
-
-    // -----------------------------------------------------------------------
-    // Actions
-    // -----------------------------------------------------------------------
 
     fn open_folder(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
@@ -505,6 +487,124 @@ impl App {
         .detach();
     }
 
+    fn choose_sorting_source_dir(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let handle = rfd::AsyncFileDialog::new()
+                .set_title("Select folder with numbered files")
+                .pick_folder()
+                .await;
+
+            if let Some(folder) = handle {
+                let dir = folder.path().to_path_buf();
+                _ = this.update(cx, |this, cx| {
+                    this.sorting_source_dir = Some(dir.clone());
+                    this.sorting_status_message =
+                        format!("Sorting source: {}", dir.display()).into();
+                    this.sorting_results.clear();
+                    this.sorting_summary = None;
+                    this.sorting_progress = 0.0;
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn start_sorting(&mut self, cx: &mut Context<Self>) {
+        if self.is_sorting {
+            return;
+        }
+
+        let Some(source_dir) = self.sorting_source_dir.clone() else {
+            self.sorting_status_message = "Select a sorting folder first".into();
+            cx.notify();
+            return;
+        };
+
+        self.is_sorting = true;
+        self.sorting_progress = 0.0;
+        self.sorting_results.clear();
+        self.sorting_summary = None;
+        self.sorting_status_message = "Sorting numbered files...".into();
+        cx.notify();
+
+        let config = NumberedSortConfig {
+            source_dir,
+            mode: if self.sorting_copy_files {
+                NumberedSortMode::Copy
+            } else {
+                NumberedSortMode::Move
+            },
+        };
+        let executor = cx.background_executor().clone();
+
+        let progress_completed = Arc::new(AtomicUsize::new(0));
+        let progress_total = Arc::new(AtomicUsize::new(0));
+        let progress_done = Arc::new(AtomicBool::new(false));
+
+        let progress_completed_for_ui = progress_completed.clone();
+        let progress_total_for_ui = progress_total.clone();
+        let progress_done_for_ui = progress_done.clone();
+        let timer_executor = executor.clone();
+
+        cx.spawn(async move |this, cx| {
+            loop {
+                timer_executor.timer(Duration::from_millis(75)).await;
+
+                let total = progress_total_for_ui.load(Ordering::Relaxed);
+                let completed = progress_completed_for_ui.load(Ordering::Relaxed);
+                let done = progress_done_for_ui.load(Ordering::Relaxed);
+
+                _ = this.update(cx, |this, cx| {
+                    if this.is_sorting {
+                        this.sorting_progress = if total == 0 {
+                            0.0
+                        } else {
+                            (completed as f32 / total as f32).clamp(0.0, 1.0)
+                        };
+                        cx.notify();
+                    }
+                });
+
+                if done {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        let progress_completed_for_worker = progress_completed.clone();
+        let progress_total_for_worker = progress_total.clone();
+        let progress_done_for_worker = progress_done.clone();
+
+        cx.spawn(async move |this, cx| {
+            let (summary, results) = executor
+                .spawn(async move {
+                    crate::processing::sort::sort_numbered_files(&config, |completed, total| {
+                        progress_total_for_worker.store(total, Ordering::Relaxed);
+                        progress_completed_for_worker.store(completed, Ordering::Relaxed);
+                    })
+                })
+                .await;
+
+            progress_done_for_worker.store(true, Ordering::Relaxed);
+
+            _ = this.update(cx, |this, cx| {
+                this.is_sorting = false;
+                this.sorting_progress = 1.0;
+                this.sorting_status_message = format!(
+                    "Sorting complete - {} sorted, {} failed, {} skipped, {} folders created",
+                    summary.sorted, summary.failed, summary.skipped, summary.folders_created
+                )
+                .into();
+                this.sorting_summary = Some(summary);
+                this.sorting_results = results;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn schedule_preview_update(&mut self, cx: &mut Context<Self>) {
         let Some(idx) = self.selected_index else {
             return;
@@ -533,17 +633,14 @@ impl App {
                 return;
             }
 
-            // Run decode/resize/overlay work off the UI executor.
             let result: Option<Arc<RenderImage>> = executor
                 .spawn(async move {
-                    // Use cache for base decode/rotation. Apply text overlay in-memory.
                     (|| {
                         let cached = cache.get_or_decode(&preview_path, rotation, None)?;
                         if text_config.is_none() {
                             return Some(cached.preview_image.clone());
                         }
 
-                        // Start with cached base image
                         let cfg = text_config.as_ref()?;
                         let preview = image::DynamicImage::ImageRgba8((*cached.rgba).clone());
                         let filename = preview_path
@@ -583,7 +680,6 @@ impl App {
         })
         .detach();
 
-        // Preload adjacent images in background (base only, text applied on fly)
         self.preload_adjacent(cx);
     }
 
@@ -630,10 +726,6 @@ impl App {
             margin: 10,
         }
     }
-
-    // -----------------------------------------------------------------------
-    // View helpers
-    // -----------------------------------------------------------------------
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity().clone();
@@ -745,6 +837,212 @@ impl App {
             .child(content)
     }
 
+    fn render_sorting(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity = cx.entity().clone();
+
+        let section_title = |label: &str| -> AnyElement {
+            div()
+                .text_sm()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(cx.theme().foreground)
+                .child(label.to_string())
+                .into_any_element()
+        };
+
+        let folder_label: SharedString = if let Some(ref dir) = self.sorting_source_dir {
+            dir.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("Selected")
+                .to_string()
+                .into()
+        } else {
+            "Not set".into()
+        };
+
+        let folder_section = v_flex()
+            .gap_2()
+            .child(section_title("Source Folder"))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().text_sm().child(folder_label))
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("sorting-browse-btn")
+                            .label("Browse")
+                            .small()
+                            .on_click({
+                                let entity = entity.clone();
+                                move |_, _, cx| {
+                                    entity
+                                        .update(cx, |this, cx| this.choose_sorting_source_dir(cx));
+                                }
+                            }),
+                    ),
+            );
+
+        let mode_section = v_flex().gap_2().child(section_title("Mode")).child(
+            Checkbox::new("sorting-copy-files")
+                .checked(self.sorting_copy_files)
+                .label("Copy files instead of moving them")
+                .on_click({
+                    let entity = entity.clone();
+                    move |checked, _, cx| {
+                        entity.update(cx, |this, cx| {
+                            this.sorting_copy_files = *checked;
+                            this.sorting_results.clear();
+                            this.sorting_summary = None;
+                            this.sorting_status_message = if *checked {
+                                "Copy mode enabled - originals will stay in place".into()
+                            } else {
+                                "Move mode enabled - files will be moved into number folders".into()
+                            };
+                            cx.notify();
+                        });
+                    }
+                }),
+        );
+
+        let examples_section = v_flex()
+            .gap_1()
+            .child(section_title("Matching Examples"))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("82.jpg, 82 (2).jpg, 82-001.jpg, 82-002 (2).jpg → folder 82"),
+            );
+
+        let start_button = if self.is_sorting {
+            Button::new("sorting-start-btn")
+                .label("Sorting...")
+                .primary()
+                .w_full()
+                .disabled(true)
+        } else {
+            Button::new("sorting-start-btn")
+                .label(if self.sorting_copy_files {
+                    "Copy Into Number Folders"
+                } else {
+                    "Move Into Number Folders"
+                })
+                .primary()
+                .w_full()
+                .on_click({
+                    let entity = entity.clone();
+                    move |_, _, cx| {
+                        entity.update(cx, |this, cx| this.start_sorting(cx));
+                    }
+                })
+        };
+
+        let summary_section = if let Some(ref summary) = self.sorting_summary {
+            v_flex()
+                .gap_1()
+                .child(section_title("Last Run"))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!(
+                            "{} discovered, {} sorted, {} failed, {} skipped, {} folders created",
+                            summary.discovered,
+                            summary.sorted,
+                            summary.failed,
+                            summary.skipped,
+                            summary.folders_created
+                        )),
+                )
+                .into_any_element()
+        } else {
+            div().into_any_element()
+        };
+
+        let failures_section = {
+            let failed: Vec<_> = self
+                .sorting_results
+                .iter()
+                .filter(|result| !result.success)
+                .take(8)
+                .collect();
+
+            if failed.is_empty() {
+                div().into_any_element()
+            } else {
+                v_flex()
+                    .gap_1()
+                    .child(section_title("Failures"))
+                    .children(failed.into_iter().map(|result| {
+                        let name = result
+                            .source
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("?");
+                        let destination = result
+                            .destination
+                            .as_ref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| "no destination".to_string());
+                        let number = result.number.as_deref().unwrap_or("?");
+                        let error = result.error.as_deref().unwrap_or("unknown error");
+                        div()
+                            .text_xs()
+                            .text_color(gpui::hsla(0.0, 0.8, 0.5, 1.0))
+                            .child(format!(
+                                "❌ {name} → {destination} (number {number}): {error}"
+                            ))
+                    }))
+                    .into_any_element()
+            }
+        };
+
+        let divider = || div().h(px(1.)).bg(cx.theme().border);
+
+        let panel = v_flex()
+            .gap_4()
+            .p_6()
+            .max_w(px(720.))
+            .child(
+                div()
+                    .text_2xl()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Sort Numbered Files"),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Select a folder and sort files into directories based on the leading number in each filename."),
+            )
+            .child(divider())
+            .child(folder_section)
+            .child(divider())
+            .child(mode_section)
+            .child(divider())
+            .child(examples_section)
+            .child(divider())
+            .child(start_button)
+            .when(self.is_sorting, |el| {
+                el.child(Progress::new("sorting-progress").value(self.sorting_progress * 100.0))
+            })
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(self.sorting_status_message.clone()),
+            )
+            .child(summary_section)
+            .child(failures_section);
+
+        div()
+            .size_full()
+            .overflow_y_scrollbar()
+            .flex()
+            .justify_center()
+            .child(panel)
+    }
+
     fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity().clone();
         let section_title = |label: &str| -> AnyElement {
@@ -756,25 +1054,21 @@ impl App {
                 .into_any_element()
         };
 
-        // Format section
         let format_section = v_flex()
             .gap_1()
             .child(section_title("Output Format"))
             .child(self.format_select.clone());
 
-        // Quality section
         let quality_section = v_flex()
             .gap_1()
             .child(section_title(&format!("JPEG Quality: {}%", self.quality)))
             .child(Slider::new(&self.quality_slider).w_full());
 
-        // Rotation section
         let rotation_section = v_flex()
             .gap_1()
             .child(section_title("Rotation"))
             .child(self.rotation_select.clone());
 
-        // Text overlay section
         let mut text_section = v_flex().gap_2().child(
             Checkbox::new("text-enabled")
                 .checked(self.text_enabled)
@@ -822,7 +1116,6 @@ impl App {
                 );
         }
 
-        // Output folder section
         let output_label: SharedString = if let Some(ref dir) = self.output_dir {
             dir.file_name()
                 .and_then(|n| n.to_str())
@@ -850,7 +1143,6 @@ impl App {
                     })),
             );
 
-        // Process button
         let process_button = if self.is_processing {
             Button::new("process-btn")
                 .label("Processing...")
@@ -869,7 +1161,6 @@ impl App {
                 })
         };
 
-        // Results
         let results_el = if self.batch_results.is_empty() {
             div().into_any_element()
         } else {
@@ -930,8 +1221,8 @@ impl Render for App {
         let entity = cx.entity().clone();
         let is_batch = mode == AppMode::BatchProcessing;
         let is_numbering = mode == AppMode::Numbering;
+        let is_sorting = mode == AppMode::Sorting;
 
-        // Inline tab rendering to avoid borrow issues
         let tab_style = |active: bool, theme: &gpui_component::theme::Theme| {
             let base = div().px_4().py_2().text_sm().cursor_pointer().border_b_2();
             if active {
@@ -970,6 +1261,17 @@ impl Render for App {
                         let entity = entity.clone();
                         move |_, _, cx| {
                             entity.update(cx, |this, cx| this.set_mode(AppMode::Numbering, cx));
+                        }
+                    }),
+            )
+            .child(
+                tab_style(is_sorting, &theme)
+                    .id("tab-sorting")
+                    .child("Sorting")
+                    .on_click({
+                        let entity = entity.clone();
+                        move |_, _, cx| {
+                            entity.update(cx, |this, cx| this.set_mode(AppMode::Sorting, cx));
                         }
                     }),
             );
@@ -1018,6 +1320,7 @@ impl Render for App {
                 .flex_1()
                 .child(self.numbering_mode.clone())
                 .into_any_element(),
+            AppMode::Sorting => self.render_sorting(cx).into_any_element(),
         };
 
         v_flex()
@@ -1028,10 +1331,6 @@ impl Render for App {
             .child(content)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 fn hsla_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
     let c = (1.0 - (2.0 * l - 1.0).abs()) * s;

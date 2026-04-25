@@ -10,6 +10,7 @@ Based on some features of FastStone Image Viewer.
 - Able to rotate the images
 - Numbering mode for fast per-image number tagging
 - OCR-based number suggestions
+- Sorting mode to quickly sort photos into subfolders based on their name
 
 ## Batch processing preview
 
@@ -18,6 +19,10 @@ Based on some features of FastStone Image Viewer.
 ## Numbering mode preview
 
 ![Numbering Preview](assets/numbering.png)
+
+## Sorintg mode preview
+
+![Sorting Preview](assets/sorting.png)
 
 ## OCR setup (optional, Numbering mode)
 

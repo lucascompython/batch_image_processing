@@ -143,11 +143,8 @@ fn decode_with_turbojpeg(raw: &[u8], preview_max_side: Option<u32>) -> Option<Dy
                 format: turbojpeg::PixelFormat::RGBA,
             };
             decompressor.decompress(raw, image.as_deref_mut()).ok()?;
-            let rgba = RgbaImage::from_raw(
-                scaled.width as u32,
-                scaled.height as u32,
-                image.pixels,
-            )?;
+            let rgba =
+                RgbaImage::from_raw(scaled.width as u32, scaled.height as u32, image.pixels)?;
             return Some(DynamicImage::ImageRgba8(rgba));
         }
     }
@@ -157,14 +154,17 @@ fn decode_with_turbojpeg(raw: &[u8], preview_max_side: Option<u32>) -> Option<Dy
     Some(DynamicImage::ImageRgba8(rgba))
 }
 
-fn select_scaling_factor(header: turbojpeg::DecompressHeader, max_side: u32) -> turbojpeg::ScalingFactor {
+fn select_scaling_factor(
+    header: turbojpeg::DecompressHeader,
+    max_side: u32,
+) -> turbojpeg::ScalingFactor {
     let max_side = max_side as usize;
     if header.width <= max_side && header.height <= max_side {
         return turbojpeg::ScalingFactor::ONE;
     }
 
-    let factors = TURBO_SCALING_FACTORS
-        .get_or_init(turbojpeg::Decompressor::supported_scaling_factors);
+    let factors =
+        TURBO_SCALING_FACTORS.get_or_init(turbojpeg::Decompressor::supported_scaling_factors);
 
     let mut best_above: Option<(turbojpeg::ScalingFactor, usize)> = None;
     let mut best_below: Option<(turbojpeg::ScalingFactor, usize)> = None;
