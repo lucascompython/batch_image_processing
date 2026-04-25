@@ -11,6 +11,14 @@ Based on some features of FastStone Image Viewer.
 - Numbering mode for fast per-image number tagging
 - OCR-based number suggestions
 
+## Batch processing preview
+
+![Processing Preview](assets/processing.png)
+
+## Numbering mode preview
+
+![Numbering Preview](assets/numbering.png)
+
 ## OCR setup (optional, Numbering mode)
 
 The app can suggest motorcycle numbers using local ONNX OCR.
