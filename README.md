@@ -1,13 +1,15 @@
-# Batch Image Processing
+# Numera
 
-Based on FastStone Image Viewer.
+An app for batch processing and numbering photos.
+Based on some features of FastStone Image Viewer.
 
 ## Features
 
-- Be able to convert images in batch to pdf/jpg
-- Be able to add text to the images (e.g. file name)
-- Be able to rotate the images
-- Numbering mode for fast per-image bike-number tagging
+- Able to convert images in batch to pdf/jpg
+- Able to add text to the images (e.g. automatically add file name in the corner, useful for printing and selling posters)
+- Able to rotate the images
+- Numbering mode for fast per-image number tagging
+- OCR-based number suggestions
 
 ## OCR setup (optional, Numbering mode)
 
